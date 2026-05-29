@@ -1,0 +1,5 @@
+build/
+filesystem/
+scenes/
+*.z64
+*.pak
