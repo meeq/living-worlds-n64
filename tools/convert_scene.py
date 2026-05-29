@@ -24,27 +24,32 @@ the first frame), so we drop it and store the timeline palettes instead.
 This script reads a scene payload (a raw .js file as fetched by
 tools/fetch_scenes.sh) and emits a compact big-endian binary (scene.lw):
 
-    Header (20 bytes):
-      char magic[4]      "LWLD"
+    Header (104 bytes):
+      char magic[4]         "LWL3"
       u16  width
       u16  height
-      u16  num_colors    (colors per palette, 256)
-      u16  num_cycles    (active cycles only, rate != 0)
-      u16  num_palettes  (timeline palettes)
-      u16  num_tl        (timeline entries)
-      u32  pixel_offset  (8-byte-aligned offset of the CI8 pixel data)
-    Palettes @20:          num_palettes * num_colors * 3 bytes (R,G,B 8-bit)
-    Cycles:                num_cycles * 8 bytes {u8 reverse,u8 low,u8 high,u8 pad,
-                                                 u16 rate, u16 pad}
-    Timeline:              num_tl * 8 bytes {u32 offset_seconds, u16 pal_index,
-                                             u16 pad}  (sorted by offset)
-    Title:                 u16 len; len bytes (UTF-8, no terminator)
-    Pixels  @pixel_offset:  width * height bytes (CI8 indices, row-major)
+      u16  num_colors       (colors per palette, 256)
+      u16  num_cycles       (active cycles only, rate != 0)
+      u16  num_palettes     (timeline palettes)
+      u16  num_tl           (timeline entries)
+      u32  pixel_offset     (8-byte-aligned offset of the CI8 pixel data)
+      char title[64]        (NUL-terminated UTF-8; max 63 bytes of payload)
+      char audio_slug[16]   (NUL-terminated ASCII; "" == silent; max 15 bytes)
+      u16  audio_volume_q8  (max volume * 256; 256 == 1.0)
+      u16  pad
+    Palettes @104:           num_palettes * num_colors * 3 bytes (R,G,B 8-bit)
+    Cycles:                  num_cycles * 8 bytes {u8 reverse,u8 low,u8 high,
+                                                   u8 pad, u16 rate, u16 pad}
+    Timeline:                num_tl * 8 bytes {u32 offset_seconds, u16 pal_index,
+                                               u16 pad}  (sorted by offset)
+    Pixels  @pixel_offset:   width * height bytes (CI8 indices, row-major)
 
-fetch_scenes.sh prepends two metadata comment lines the demo's scenes.js catalog
+fetch_scenes.sh prepends metadata comment lines the demo's scenes.js catalog
 carries but the scene payload does not:
     // title: <human readable name>      -> embedded in the .lw, shown in the HUD
     // remap: idx=r,g,b;idx=r,g,b        -> palette index overrides applied here
+    // audio: <SLUG>                     -> ambient loop, played as rom:/<slug>.wav64
+    // volume: <0..1>                    -> per-scene max volume (default 1.0)
 """
 
 import argparse
@@ -53,8 +58,11 @@ import re
 import struct
 import sys
 
-MAGIC = b"LWLD"
-HEADER_LEN = 20
+MAGIC = b"LWL3"
+HEADER_LEN = 104
+TITLE_MAX = 64               # NUL-terminated; payload limit is TITLE_MAX - 1
+SLUG_MAX = 16                # NUL-terminated; payload limit is SLUG_MAX - 1
+DEFAULT_VOLUME_Q8 = 256      # 1.0 in Q8
 
 
 def parse_scene(text):
@@ -96,12 +104,28 @@ def clamp_bytes(values):
     return bytes(min(255, max(0, int(v))) for v in values)
 
 
+def fixed_str(b, n, label):
+    """NUL-pad `b` to exactly `n` bytes; reserve one byte for the terminator."""
+    if len(b) > n - 1:
+        sys.exit(f"error: {label} too long ({len(b)} bytes, max {n - 1}): {b!r}")
+    return b + b"\x00" * (n - len(b))
+
+
 def convert(src_path, out_path):
     with open(src_path, "rb") as f:
         text = f.read().decode("utf-8", "replace")
 
     title = grab_header_comment(text, "title")
     remap = parse_remap(grab_header_comment(text, "remap"))
+    audio_slug = (grab_header_comment(text, "audio") or "").strip()
+    volume_str = grab_header_comment(text, "volume")
+    if volume_str is None:
+        volume_q8 = DEFAULT_VOLUME_Q8
+    else:
+        try:
+            volume_q8 = max(0, min(0xFFFF, round(float(volume_str) * 256)))
+        except ValueError:
+            sys.exit(f"error: bad volume '{volume_str}' (expected float)")
     scene = parse_scene(text)
     base = scene["base"]
     width, height = base["width"], base["height"]
@@ -159,19 +183,18 @@ def convert(src_path, out_path):
         for c in cycles
     )
 
-    title_bytes = (title or "").encode("utf-8")[:0xFFFF]
-    title_block = struct.pack(">H", len(title_bytes)) + title_bytes
+    title_bytes = fixed_str((title or "").encode("utf-8"), TITLE_MAX, "title")
+    slug_bytes  = fixed_str(audio_slug.encode("ascii"), SLUG_MAX, "audio slug")
 
-    body_len = (
-        HEADER_LEN + len(pal_bytes) + len(cyc_bytes) + len(tl_bytes) + len(title_block)
-    )
+    body_len = HEADER_LEN + len(pal_bytes) + len(cyc_bytes) + len(tl_bytes)
     pixel_offset = (body_len + 7) & ~7  # 8-byte align the pixel block
     pad = b"\x00" * (pixel_offset - body_len)
 
     header = MAGIC + struct.pack(
-        ">HHHHHHI",
+        ">HHHHHHI64s16sHH",
         width, height, num_colors, len(cycles), len(palettes), len(timeline),
         pixel_offset,
+        title_bytes, slug_bytes, volume_q8, 0,
     )
     assert len(header) == HEADER_LEN, len(header)
 
@@ -180,7 +203,6 @@ def convert(src_path, out_path):
         f.write(pal_bytes)
         f.write(cyc_bytes)
         f.write(tl_bytes)
-        f.write(title_block)
         f.write(pad)
         f.write(clamp_bytes(pixels))
 
@@ -188,6 +210,7 @@ def convert(src_path, out_path):
         f"    [{out_path}] {width}x{height}, {num_colors} colors, "
         f"{len(palettes)} palettes, {len(timeline)} timeline entries, "
         f"{len(cycles)} active cycles, title={title!r}, "
+        f"audio={audio_slug or 'none'!r} vol={volume_q8 / 256.0:.2f}, "
         f"pixel_offset={pixel_offset}, {pixel_offset + len(pixels)} bytes"
     )
 

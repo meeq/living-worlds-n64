@@ -1,6 +1,8 @@
 build/
 filesystem/
 scenes/
+sounds/
 *.z64
 *.pak
 *.webarchive
+.DS_Store
