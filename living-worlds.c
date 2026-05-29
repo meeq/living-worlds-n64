@@ -18,7 +18,7 @@
  * simulated day, like the reference), RTC (follows the hardware/software clock
  * via the RTC subsystem), and HOLD (frozen). C-left/C-right scrub time by hand.
  *
- * Asset: rom:/ *.lw (format v2), produced by tools/convert_scene.py.
+ * Asset: rom:/ *.lw (format LWLD), produced by tools/convert_scene.py.
  */
 
 #include <libdragon.h>
@@ -38,28 +38,35 @@
 #define MAX_TL        64        /* timeline entries (largest scene has 46) */
 #define FONT_HUD      1
 
-typedef struct {
-    uint8_t  reverse;
-    uint8_t  low;
-    uint8_t  high;
-    uint16_t rate;
-} cycle_t;
-
-typedef struct {
-    uint32_t off;    /* seconds since midnight */
-    uint16_t pidx;   /* index into the palette table */
-} tl_entry_t;
-
 typedef enum { TIME_AUTO, TIME_RTC, TIME_HOLD } time_src_t;
+
+/* Big-endian file layouts overlaid directly on the asset_load buffer. The N64
+ * is big-endian and every multi-byte field is laid out on its natural alignment
+ * by design (note the explicit pad slots), so direct field reads just work. */
+typedef struct {
+    char     magic[4];                 /* "LWLD" */
+    uint16_t width, height, num_colors, num_cycles, num_palettes, num_tl;
+    uint32_t pixel_offset;
+} lw_header_t;                         /* sizeof == 20 */
+
+typedef struct {
+    uint8_t  reverse, low, high, pad;
+    uint16_t rate, pad2;
+} lw_cycle_t;                          /* sizeof == 8 */
+
+typedef struct {
+    uint32_t off;                      /* seconds since midnight */
+    uint16_t pidx, pad;
+} lw_tl_t;                             /* sizeof == 8 */
 
 /* scene data (rebuilt on every load_scene) */
 static void     *scene_buf;            /* asset_load buffer (kept alive) */
 static int       img_w, img_h;
 static int       num_colors, num_cycles, num_palettes, num_tl;
 static char      scene_title[64];      /* embedded title, shown in the HUD */
-static const uint8_t *pal_table;       /* num_palettes * num_colors * 3, in scene_buf */
-static cycle_t   cycles[MAX_COLORS];
-static tl_entry_t timeline[MAX_TL];    /* sorted by offset */
+static const uint8_t    *pal_table;    /* num_palettes * num_colors * 3, in scene_buf */
+static const lw_cycle_t *cycles;       /* num_cycles entries, in scene_buf */
+static const lw_tl_t    *timeline;     /* num_tl entries, sorted by offset, in scene_buf */
 static uint8_t   base_r[MAX_COLORS];   /* per-frame time-of-day palette (pre-cycling) */
 static uint8_t   base_g[MAX_COLORS];
 static uint8_t   base_b[MAX_COLORS];
@@ -80,15 +87,6 @@ static uint32_t   scene_ms   = 0;          /* pausable clock driving the cycling
 static float      time_of_day = 43200.0f;  /* seconds since midnight, [0, 86400) */
 static time_src_t time_src   = TIME_AUTO;
 static bool       rtc_present = false;
-
-static inline uint16_t rd16(const uint8_t *p)
-{
-    return (p[0] << 8) | p[1];
-}
-static inline uint32_t rd32(const uint8_t *p)
-{
-    return ((uint32_t)p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
-}
 
 /* Seconds since midnight from the RTC subsystem (hardware clock if present,
  * software clock otherwise - either way time(NULL) is hooked by rtc_init). */
@@ -114,49 +112,34 @@ static void load_scene(const char *path)
     scene_buf = asset_load(path, &sz);
     assertf(scene_buf, "could not load %s", path);
 
-    const uint8_t *b = scene_buf;
-    assertf(memcmp(b, "LWLD", 4) == 0, "%s: bad magic / stale asset", path);
+    const lw_header_t *h = scene_buf;
+    assertf(memcmp(h->magic, "LWLD", 4) == 0, "%s: bad magic / stale asset", path);
 
-    img_w        = rd16(b + 4);
-    img_h        = rd16(b + 6);
-    num_colors   = rd16(b + 8);
-    num_cycles   = rd16(b + 10);
-    num_palettes = rd16(b + 12);
-    num_tl       = rd16(b + 14);
-    uint32_t pix = rd32(b + 16);
+    img_w        = h->width;
+    img_h        = h->height;
+    num_colors   = h->num_colors;
+    num_cycles   = h->num_cycles;
+    num_palettes = h->num_palettes;
+    num_tl       = h->num_tl;
 
     assertf(num_colors <= MAX_COLORS, "%s: too many colors (%d)", path, num_colors);
     assertf(num_tl <= MAX_TL, "%s: too many timeline entries (%d)", path, num_tl);
     assertf(num_palettes > 0 && num_tl > 0, "%s: missing time-of-day data", path);
 
-    pal_table = b + 20;
-
-    const uint8_t *cyc = pal_table + (uint32_t)num_palettes * num_colors * 3;
-    for (int i = 0; i < num_cycles; i++) {
-        const uint8_t *c = cyc + i * 8;
-        cycles[i].reverse = c[0];
-        cycles[i].low     = c[1];
-        cycles[i].high    = c[2];
-        cycles[i].rate    = rd16(c + 4);
-    }
-
-    const uint8_t *tl = cyc + num_cycles * 8;
-    for (int i = 0; i < num_tl; i++) {
-        const uint8_t *e = tl + i * 8;
-        timeline[i].off  = rd32(e);
-        timeline[i].pidx = rd16(e + 4);
-    }
+    pal_table = (const uint8_t *)(h + 1);
+    cycles    = (const void *)(pal_table + (uint32_t)num_palettes * num_colors * 3);
+    timeline  = (const void *)(cycles + num_cycles);
 
     /* Title block (u16 len + UTF-8 bytes) sits between the timeline and the
      * 8-byte-aligned pixel data. */
-    const uint8_t *t = tl + num_tl * 8;
-    int tlen = rd16(t);
+    const uint8_t *t = (const uint8_t *)(timeline + num_tl);
+    int tlen = *(const uint16_t *)t;
     if (tlen > (int)sizeof(scene_title) - 1)
         tlen = sizeof(scene_title) - 1;
     memcpy(scene_title, t + 2, tlen);
     scene_title[tlen] = '\0';
 
-    const uint8_t *pixels = b + pix;
+    const uint8_t *pixels = (const uint8_t *)scene_buf + h->pixel_offset;
     idx_surf = surface_make_linear((void *)pixels, FMT_CI8, img_w, img_h);
     /* The RDP DMAs the index bytes; make sure they are flushed from the CPU cache. */
     data_cache_hit_writeback((void *)pixels, (uint32_t)img_w * img_h);
@@ -254,7 +237,7 @@ static void build_palette(void)
 
     if (cycling) {
         for (int ci = 0; ci < num_cycles; ci++) {
-            cycle_t *c = &cycles[ci];
+            const lw_cycle_t *c = &cycles[ci];
             int size = c->high - c->low + 1;
             if (c->rate == 0 || size <= 1) continue;
 
@@ -314,6 +297,8 @@ int main(void)
     joypad_init();
     timer_init();
 
+    display_init(RESOLUTION_640x480, DEPTH_16_BPP, 2, GAMMA_NONE, FILTERS_DISABLED);
+
     /* Hooks time(NULL) into the RTC (hardware clock if present, else software). */
     rtc_present = rtc_init();
     time_of_day = rtc_seconds_of_day();   /* open at the real time of day */
@@ -323,11 +308,6 @@ int main(void)
     load_scene(scene_paths[scene_idx]);
 
     rdpq_text_register_font(FONT_HUD, rdpq_font_load_builtin(FONT_BUILTIN_DEBUG_MONO));
-
-    /* The full-res index map blits 1:1 into a native 640x480 framebuffer, so the
-     * RDP never scales (no fractional-blit banding). Interlaced so all 480 lines
-     * are shown. Color is 16bpp: the TLUT is RGBA16, so 32bpp adds no precision. */
-    display_init(RESOLUTION_640x480, DEPTH_16_BPP, 2, GAMMA_NONE, FILTERS_DISABLED);
 
     uint32_t last = get_ticks_ms();
     while (1) {
