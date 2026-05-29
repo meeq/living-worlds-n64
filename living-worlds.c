@@ -115,7 +115,7 @@ static void load_scene(const char *path)
     assertf(scene_buf, "could not load %s", path);
 
     const uint8_t *b = scene_buf;
-    assertf(memcmp(b, "LWL2", 4) == 0, "%s: bad magic / stale asset", path);
+    assertf(memcmp(b, "LWLD", 4) == 0, "%s: bad magic / stale asset", path);
 
     img_w        = rd16(b + 4);
     img_h        = rd16(b + 6);
@@ -123,13 +123,13 @@ static void load_scene(const char *path)
     num_cycles   = rd16(b + 10);
     num_palettes = rd16(b + 12);
     num_tl       = rd16(b + 14);
-    uint32_t pix = rd32(b + 20);
+    uint32_t pix = rd32(b + 16);
 
     assertf(num_colors <= MAX_COLORS, "%s: too many colors (%d)", path, num_colors);
     assertf(num_tl <= MAX_TL, "%s: too many timeline entries (%d)", path, num_tl);
     assertf(num_palettes > 0 && num_tl > 0, "%s: missing time-of-day data", path);
 
-    pal_table = b + 24;
+    pal_table = b + 20;
 
     const uint8_t *cyc = pal_table + (uint32_t)num_palettes * num_colors * 3;
     for (int i = 0; i < num_cycles; i++) {
