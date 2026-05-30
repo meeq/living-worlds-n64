@@ -107,6 +107,33 @@ typedef struct {
 
 typedef enum { TIME_AUTO, TIME_RTC, TIME_HOLD } time_src_t;
 
+/* On-cart save layout. Two EEPROM blocks (16 bytes); the trailing 4 bytes are
+ * reserved so we can extend without bumping the magic. Persisted on every
+ * user-visible state change (dirty-flag, flushed once per frame); the libdragon
+ * EEPROM driver coalesces background writes. Magic + version gate prevents
+ * reading garbage from a blank/foreign cart. */
+typedef union {
+    struct __attribute__((packed)) {
+        unsigned cycling    : 1;
+        unsigned blendshift : 1;
+        unsigned sound_on   : 1;
+        unsigned _reserved  : 5;
+    };
+    uint8_t raw;
+} lw_save_flags_t;
+_Static_assert(sizeof(lw_save_flags_t) == 1, "lw_save_flags_t must pack into a single byte");
+
+typedef struct {
+    char            magic[4];        /* "LWS1" */
+    lw_save_flags_t flags;
+    uint8_t         time_src;        /* time_src_t value */
+    uint8_t         scene_idx;       /* index into the sorted scene catalog */
+    uint8_t         pad;
+    uint32_t        time_of_day_s;   /* seconds since midnight; only meaningful when time_src == TIME_HOLD */
+    uint32_t        reserved;
+} lw_save_t;                         /* sizeof == 16 */
+_Static_assert(sizeof(lw_save_t) == 16, "lw_save_t must be 16 bytes (2 EEPROM blocks)");
+
 /* working buffers */
 static surface_t idx_surf;            /* FMT_CI8 view over the full-res pixel bytes */
 static uint8_t   base_r[MAX_COLORS];
@@ -155,6 +182,7 @@ static float      title_alpha   = 1.0f;        /* 1.0 visible, 0.0 gone */
 static float      title_t       = 0.0f;        /* seconds in UI_TITLE */
 static bool       title_dismiss = false;       /* fade-out requested */
 static int        menu_focus    = ROW_SCENE;
+static bool       save_dirty    = false;       /* pending EEPROM flush */
 
 /* wav64 cache: open each unique slug at most once and stream from ROM. */
 static char    wav_slugs[MAX_AUDIO_SLUGS][SLUG_MAX];
@@ -398,6 +426,46 @@ static void start_scene_audio(const char *slug, float max_vol)
     }
 }
 
+/* Read the persisted save (if any) and overlay it on the defaults. Silent
+ * no-op on carts without EEPROM or with a stale/missing magic. Must run after
+ * enumerate_scenes() so scene_idx can be range-checked against scene_count. */
+static void save_load(void)
+{
+    if (eeprom_present() == EEPROM_NONE) return;
+    lw_save_t s;
+    eeprom_read_bytes(&s, 0, sizeof(s));
+    if (memcmp(s.magic, "LWS1", 4) != 0) return;
+
+    cycling    = s.flags.cycling;
+    blendshift = s.flags.blendshift;
+    sound_on   = s.flags.sound_on;
+    if (s.time_src <= TIME_HOLD)             time_src    = (time_src_t)s.time_src;
+    if (s.scene_idx < (unsigned)scene_count) scene_idx   = s.scene_idx;
+    if (s.time_of_day_s < SECS_PER_DAY)      time_of_day = (float)s.time_of_day_s;
+}
+
+/* Serialize the current settings into 2 EEPROM blocks. libdragon writes
+ * through a RAM cache + background flusher, so this is a cheap memcpy-class
+ * call; rate-limiting the flush to once per frame via save_dirty keeps the
+ * write burst bounded during a held scrub. */
+static void save_flush(void)
+{
+    if (!save_dirty) return;
+    save_dirty = false;
+    if (eeprom_present() == EEPROM_NONE) return;
+
+    lw_save_t s = {
+        .magic         = { 'L', 'W', 'S', '1' },
+        .flags         = { .cycling = cycling, .blendshift = blendshift, .sound_on = sound_on },
+        .time_src      = (uint8_t)time_src,
+        .scene_idx     = (uint8_t)scene_idx,
+        .pad           = 0,
+        .time_of_day_s = (uint32_t)time_of_day,
+        .reserved      = 0,
+    };
+    eeprom_write_bytes(&s, 0, sizeof(s));
+}
+
 /* Fill a rectangle with a flat (combiner) color, blending against the
  * framebuffer via the prim alpha. Caller must call rdpq_set_mode_standard()
  * again before resuming normal sprite/text draws. */
@@ -554,6 +622,7 @@ static void menu_change(int row, int dir)
             break;
         case ROW_SOUND:       sound_on   = !sound_on;   break;
     }
+    save_dirty = true;
 }
 
 static void menu_activate(int row)
@@ -600,7 +669,8 @@ static bool menu_handle_input(joypad_buttons_t pressed, float dt)
         hx += joypad_get_axis_held(JOYPAD_PORT_1, JOYPAD_AXIS_STICK_X);
         if (hx) {
             time_of_day += hx * SCRUB_RATE * dt;
-            time_src = TIME_HOLD;
+            time_src   = TIME_HOLD;
+            save_dirty = true;
         }
     }
 
@@ -632,6 +702,13 @@ int main(void)
 
     enumerate_scenes();
     assertf(scene_count > 0, "no rom:/*.lw scenes found");
+
+    /* Pull persisted settings before the first scene load so the saved
+     * scene_idx wins. For AUTO/RTC modes, snap time_of_day back to the real
+     * clock — the saved value is only authoritative when source is HOLD. */
+    save_load();
+    if (time_src != TIME_HOLD) time_of_day = rtc_seconds_of_day();
+
     load_scene(scene_paths[scene_idx]);
     start_scene_audio(hdr->audio_slug, hdr->audio_volume_q8 / 256.0f);
 
@@ -722,5 +799,7 @@ int main(void)
         mixer_try_play();
         rdpq_detach_show();
         mixer_try_play();
+
+        save_flush();
     }
 }
