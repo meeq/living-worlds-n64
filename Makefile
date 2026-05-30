@@ -13,7 +13,7 @@ src = living-worlds.c
 # volume, palette remap) is read from scenes.json -- the committed scene
 # catalog (regenerated from upstream by tools/fetch_catalog.py).
 scene_files := $(wildcard scenes/*.js)
-assets_conv := $(patsubst scenes/%.js,filesystem/%.lw,$(scene_files))
+assets_lw := $(patsubst scenes/%.js,filesystem/%.lw,$(scene_files))
 
 # Ambient audio loops: 13 shared MP3s from the reference demo, converted to
 # Opus-compressed .wav64 (streamed from ROM by wav64_open / wav64_play). Run
@@ -22,7 +22,7 @@ sound_files := $(wildcard sounds/*.mp3)
 assets_wav  := $(patsubst sounds/%.mp3,filesystem/%.wav64,$(sound_files))
 
 # If no scenes have been fetched yet, provide instructions to fetch them.
-ifeq ($(assets_conv),)
+ifeq ($(assets_lw),)
 ifeq ($(filter clean scenes sounds,$(MAKECMDGOALS)),)
 $(error no scenes/ found - run 'make scenes' (or tools/fetch_scenes.py) first)
 endif
@@ -36,10 +36,14 @@ scenes:
 sounds:
 	@$(PYTHON) tools/fetch_sounds.py
 
-filesystem/%.lw: scenes/%.js scenes.json tools/convert_scene.py
-	@mkdir -p $(dir $@)
+scenes/%.lw: scenes/%.js scenes.json tools/convert_scene.py
 	@echo "    [SCENE] $@"
 	@$(PYTHON) tools/convert_scene.py -o $@ $<
+
+filesystem/%.lw: scenes/%.lw
+	@mkdir -p $(dir $@)
+	@$(N64_INST)/bin/mkasset --compress 1 --window 256 \
+	    --output $(dir $@) $< >/dev/null
 
 filesystem/%.wav64: sounds/%.mp3
 	@mkdir -p $(dir $@)
@@ -47,7 +51,7 @@ filesystem/%.wav64: sounds/%.mp3
 	@$(N64_AUDIOCONV) --wav-mono --wav-compress 3 \
 	    --wav-loop true -o $(dir $@) $< >/dev/null
 
-$(BUILD_DIR)/living-worlds.dfs: $(assets_conv) $(assets_wav)
+$(BUILD_DIR)/living-worlds.dfs: $(assets_lw) $(assets_wav)
 $(BUILD_DIR)/living-worlds.elf: $(src:%.c=$(BUILD_DIR)/%.o)
 
 living-worlds.z64: N64_ROM_TITLE="Living Worlds"
