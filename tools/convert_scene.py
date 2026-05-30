@@ -21,8 +21,8 @@ run on top of those static indices:
 `base.colors` is never displayed by the reference (the timeline overrides it on
 the first frame), so we drop it and store the timeline palettes instead.
 
-This script reads a scene payload (a raw .js file as fetched by
-tools/fetch_scenes.sh) and emits a compact big-endian binary (scene.lw):
+This script reads a scene payload (the verbatim JSONP fetched by
+tools/fetch_scenes.py) and emits a compact big-endian binary (scene.lw):
 
     Header (104 bytes):
       char magic[4]         "LWL3"
@@ -44,12 +44,10 @@ tools/fetch_scenes.sh) and emits a compact big-endian binary (scene.lw):
                                                u16 pad}  (sorted by offset)
     Pixels  @pixel_offset:   width * height bytes (CI8 indices, row-major)
 
-fetch_scenes.sh prepends metadata comment lines the demo's scenes.js catalog
-carries but the scene payload does not:
-    // title: <human readable name>      -> embedded in the .lw, shown in the HUD
-    // remap: idx=r,g,b;idx=r,g,b        -> palette index overrides applied here
-    // audio: <SLUG>                     -> ambient loop, played as rom:/<slug>.wav64
-    // volume: <0..1>                    -> per-scene max volume (default 1.0)
+Per-scene metadata that scene.php doesn't return (title, ambient audio loop,
+max volume, palette remap) comes from scenes.json -- the committed scene
+catalog (regenerated from upstream by tools/fetch_catalog.py). The slug used
+to look up the record is the source filename stem (scenes/<slug>.js).
 """
 
 import argparse
@@ -57,12 +55,14 @@ import json
 import re
 import struct
 import sys
+from pathlib import Path
 
 MAGIC = b"LWL3"
 HEADER_LEN = 104
 TITLE_MAX = 64               # NUL-terminated; payload limit is TITLE_MAX - 1
 SLUG_MAX = 16                # NUL-terminated; payload limit is SLUG_MAX - 1
 DEFAULT_VOLUME_Q8 = 256      # 1.0 in Q8
+CATALOG = Path(__file__).resolve().parent.parent / "scenes.json"
 
 
 def parse_scene(text):
@@ -78,27 +78,6 @@ def parse_scene(text):
         sys.exit(f"error: could not parse scene payload as JSON: {e}")
 
 
-def grab_header_comment(text, key):
-    """Return the value of a `// {key}: ...` header line, or None if absent."""
-    m = re.search(rf"^//\s*{key}:\s*(.+?)\s*$", text, re.MULTILINE)
-    return m.group(1) if m else None
-
-
-def parse_remap(spec):
-    """Parse 'idx=r,g,b;idx=r,g,b' into {idx: (r, g, b)}."""
-    out = {}
-    for part in (spec or "").split(";"):
-        part = part.strip()
-        if not part:
-            continue
-        idx_s, _, rgb_s = part.partition("=")
-        rgb = [int(v) for v in rgb_s.split(",")]
-        if not idx_s.strip().isdigit() or len(rgb) != 3:
-            sys.exit(f"error: bad remap entry '{part}'")
-        out[int(idx_s)] = tuple(rgb)
-    return out
-
-
 def clamp_bytes(values):
     """Pack an iterable of ints into bytes, clamping each to 0..255."""
     return bytes(min(255, max(0, int(v))) for v in values)
@@ -111,21 +90,17 @@ def fixed_str(b, n, label):
     return b + b"\x00" * (n - len(b))
 
 
-def convert(src_path, out_path):
-    with open(src_path, "rb") as f:
-        text = f.read().decode("utf-8", "replace")
+def convert(src_path, out_path, record):
+    src = Path(src_path)
+    text = src.read_bytes().decode("utf-8", "replace")
 
-    title = grab_header_comment(text, "title")
-    remap = parse_remap(grab_header_comment(text, "remap"))
-    audio_slug = (grab_header_comment(text, "audio") or "").strip()
-    volume_str = grab_header_comment(text, "volume")
-    if volume_str is None:
-        volume_q8 = DEFAULT_VOLUME_Q8
-    else:
-        try:
-            volume_q8 = max(0, min(0xFFFF, round(float(volume_str) * 256)))
-        except ValueError:
-            sys.exit(f"error: bad volume '{volume_str}' (expected float)")
+    title = record["title"]
+    audio_slug = (record["sound"] or "").strip()
+    volume = record["volume"]
+    volume_q8 = (DEFAULT_VOLUME_Q8 if volume is None
+                 else max(0, min(0xFFFF, round(float(volume) * 256))))
+    remap = {int(k): tuple(v) for k, v in (record["remap"] or {}).items()}
+
     scene = parse_scene(text)
     base = scene["base"]
     width, height = base["width"], base["height"]
@@ -217,10 +192,17 @@ def convert(src_path, out_path):
 
 def main():
     ap = argparse.ArgumentParser(description="Convert a Canvas Cycle scene to scene.lw")
-    ap.add_argument("source", help="path to a scene .js payload")
+    ap.add_argument("source", help="path to a scene .js payload (scenes/<slug>.js)")
     ap.add_argument("-o", "--output", required=True, help="output scene.lw path")
     args = ap.parse_args()
-    convert(args.source, args.output)
+
+    slug = Path(args.source).stem
+    catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
+    record = next((r for r in catalog if r["slug"] == slug), None)
+    if record:
+        convert(args.source, args.output, record)
+    else:
+        sys.exit(f"error: slug {slug!r} not found in {CATALOG}")
 
 
 if __name__ == "__main__":

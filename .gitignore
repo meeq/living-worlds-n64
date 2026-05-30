@@ -1,8 +1,9 @@
-build/
-filesystem/
-scenes/
-sounds/
+/build/
+/filesystem/
+/scenes/
+/sounds/
 *.z64
 *.pak
 *.webarchive
+__pycache__/
 .DS_Store

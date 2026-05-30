@@ -1,0 +1,237 @@
+[
+  {
+    "slug": "01_jan_winter_forest_clear",
+    "title": "January - Winter Forest - Clear",
+    "file": "V26",
+    "month": "01January",
+    "script": "janclrscpt",
+    "sound": "V13",
+    "volume": null,
+    "remap": null
+  },
+  {
+    "slug": "02_jan_winter_forest_snow",
+    "title": "January - Winter Forest - Snow",
+    "file": "V26SNOW",
+    "month": "01January",
+    "script": "jansnowscpt",
+    "sound": "V05RAIN",
+    "volume": 0.25,
+    "remap": null
+  },
+  {
+    "slug": "03_feb_mountain_stream_clear",
+    "title": "February - Mountain Stream - Clear",
+    "file": "V19",
+    "month": "02February",
+    "script": "febclrscpt",
+    "sound": "V19",
+    "volume": null,
+    "remap": null
+  },
+  {
+    "slug": "04_feb_mountain_stream_cloudy",
+    "title": "February - Mountain Stream - Cloudy",
+    "file": "V19",
+    "month": "02February",
+    "script": "febcldyscpt",
+    "sound": "V19",
+    "volume": null,
+    "remap": null
+  },
+  {
+    "slug": "05_mar_monolith_plains_clear",
+    "title": "March - Monolith Plains - Clear",
+    "file": "VW3BASIC",
+    "month": "03March",
+    "script": "MARCLRSCPT",
+    "sound": null,
+    "volume": null,
+    "remap": null
+  },
+  {
+    "slug": "06_apr_deep_forest_clear",
+    "title": "April - Deep Forest - Clear",
+    "file": "V30",
+    "month": "04April",
+    "script": "aprclrscpt",
+    "sound": "V30",
+    "volume": 0.25,
+    "remap": null
+  },
+  {
+    "slug": "07_apr_deep_forest_rain",
+    "title": "April - Deep Forest - Rain",
+    "file": "V30RAIN",
+    "month": "04April",
+    "script": "aprrainscpt",
+    "sound": "V30RAIN",
+    "volume": null,
+    "remap": null
+  },
+  {
+    "slug": "08_may_jungle_waterfall_clear",
+    "title": "May - Jungle Waterfall - Clear",
+    "file": "V08",
+    "month": "05May",
+    "script": "MAYCLRSCPT",
+    "sound": "V08",
+    "volume": 0.25,
+    "remap": null
+  },
+  {
+    "slug": "09_may_jungle_waterfall_cloudy",
+    "title": "May - Jungle Waterfall - Cloudy",
+    "file": "V08",
+    "month": "05May",
+    "script": "MAYCLDYSCPT",
+    "sound": "V08",
+    "volume": 0.25,
+    "remap": null
+  },
+  {
+    "slug": "10_may_jungle_waterfall_rain",
+    "title": "May - Jungle Waterfall - Rain",
+    "file": "V08RAIN",
+    "month": "05May",
+    "script": "MAYRAINSCPT",
+    "sound": "V08RAIN",
+    "volume": null,
+    "remap": null
+  },
+  {
+    "slug": "11_jun_crystal_caves_clear",
+    "title": "June - Crystal Caves - Clear",
+    "file": "V20JOE",
+    "month": "06June",
+    "script": "jundayscpt",
+    "sound": "V20",
+    "volume": null,
+    "remap": null
+  },
+  {
+    "slug": "12_jul_desert_clear",
+    "title": "July - Desert - Clear",
+    "file": "V25",
+    "month": "07July",
+    "script": "julyclearscpt",
+    "sound": "V25HEAT",
+    "volume": null,
+    "remap": null
+  },
+  {
+    "slug": "13_jul_desert_cloudy",
+    "title": "July - Desert - Cloudy",
+    "file": "V25",
+    "month": "07July",
+    "script": "julycloudyscpt",
+    "sound": "V25HEAT",
+    "volume": null,
+    "remap": null
+  },
+  {
+    "slug": "14_aug_aquarius_clear",
+    "title": "August - Aquarius - Clear",
+    "file": "CORAL",
+    "month": "08August",
+    "script": "augclrscpt",
+    "sound": "CORAL",
+    "volume": 0.25,
+    "remap": {
+      "0": [0, 0, 0]
+    }
+  },
+  {
+    "slug": "15_sep_seascape_clear",
+    "title": "September - Seascape - Clear",
+    "file": "V29",
+    "month": "09September",
+    "script": "SEPTCLRCUMSCPT",
+    "sound": "V29",
+    "volume": null,
+    "remap": {
+      "252": [11, 11, 11]
+    }
+  },
+  {
+    "slug": "16_sep_seascape_cloudy",
+    "title": "September - Seascape - Cloudy",
+    "file": "V29",
+    "month": "09September",
+    "script": "SEPTCLDYSCPT",
+    "sound": "V29",
+    "volume": null,
+    "remap": {
+      "252": [11, 11, 11]
+    }
+  },
+  {
+    "slug": "17_oct_haunted_ruins_early_clear",
+    "title": "Early October - Haunted Ruins - Clear",
+    "file": "V05AM",
+    "month": "10October",
+    "script": "octbegclrscpt",
+    "sound": "V13",
+    "volume": null,
+    "remap": {
+      "254": [0, 0, 0],
+      "0": [11, 11, 11]
+    }
+  },
+  {
+    "slug": "18_oct_haunted_ruins_late_clear",
+    "title": "Late October - Haunted Ruins - Clear",
+    "file": "V05AM",
+    "month": "10October",
+    "script": "octendclrscpt",
+    "sound": "V13",
+    "volume": null,
+    "remap": {
+      "254": [0, 0, 0],
+      "0": [11, 11, 11]
+    }
+  },
+  {
+    "slug": "19_oct_haunted_ruins_late_rain",
+    "title": "Late October - Haunted Ruins - Rain",
+    "file": "V05RAIN",
+    "month": "10October",
+    "script": "octrainscpt",
+    "sound": "V05RAIN",
+    "volume": null,
+    "remap": {
+      "254": [0, 0, 0],
+      "0": [11, 11, 11]
+    }
+  },
+  {
+    "slug": "20_nov_mirror_pond_clear",
+    "title": "November - Mirror Pond - Clear",
+    "file": "V16",
+    "month": "11November",
+    "script": "novclrscpt",
+    "sound": "V16",
+    "volume": null,
+    "remap": null
+  },
+  {
+    "slug": "21_nov_mirror_pond_rain",
+    "title": "November - Mirror Pond - Rain",
+    "file": "V16RAIN",
+    "month": "11November",
+    "script": "novrainscpt",
+    "sound": "V16RAIN",
+    "volume": null,
+    "remap": null
+  },
+  {
+    "slug": "22_dec_winter_manor_clear",
+    "title": "December - Winter Manor - Clear",
+    "file": "V12BASIC",
+    "month": "12December",
+    "script": "DECCLRSCPT",
+    "sound": "V13",
+    "volume": null,
+    "remap": null
+  }
+]

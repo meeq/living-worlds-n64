@@ -9,7 +9,9 @@ src = living-worlds.c
 # not used: it would re-quantize/remap palette indices, destroying the exact
 # index ordering that color cycling depends on). Run `make scenes` once to
 # download all 22 scenes into scenes/*.js; each is then converted to a
-# filesystem/*.lw and bundled into the ROM.
+# filesystem/*.lw and bundled into the ROM. Per-scene metadata (title, audio,
+# volume, palette remap) is read from scenes.json -- the committed scene
+# catalog (regenerated from upstream by tools/fetch_catalog.py).
 scene_files := $(wildcard scenes/*.js)
 assets_conv := $(patsubst scenes/%.js,filesystem/%.lw,$(scene_files))
 
@@ -22,19 +24,19 @@ assets_wav  := $(patsubst sounds/%.mp3,filesystem/%.wav64,$(sound_files))
 # If no scenes have been fetched yet, provide instructions to fetch them.
 ifeq ($(assets_conv),)
 ifeq ($(filter clean scenes sounds,$(MAKECMDGOALS)),)
-$(error no scenes/ found - run 'make scenes' (or tools/fetch_scenes.sh) first)
+$(error no scenes/ found - run 'make scenes' (or tools/fetch_scenes.py) first)
 endif
 endif
 
 all: living-worlds.z64
 
 scenes:
-	bash tools/fetch_scenes.sh
+	@$(PYTHON) tools/fetch_scenes.py
 
 sounds:
-	bash tools/fetch_sounds.sh
+	@$(PYTHON) tools/fetch_sounds.py
 
-filesystem/%.lw: scenes/%.js tools/convert_scene.py
+filesystem/%.lw: scenes/%.js scenes.json tools/convert_scene.py
 	@mkdir -p $(dir $@)
 	@echo "    [SCENE] $@"
 	@$(PYTHON) tools/convert_scene.py -o $@ $<
