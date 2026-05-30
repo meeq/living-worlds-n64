@@ -56,6 +56,7 @@ $(BUILD_DIR)/living-worlds.elf: $(src:%.c=$(BUILD_DIR)/%.o)
 
 living-worlds.z64: N64_ROM_TITLE="Living Worlds"
 living-worlds.z64: N64_ROM_SAVETYPE=eeprom4k
+living-worlds.z64: N64_ROM_RTC=true
 living-worlds.z64: $(BUILD_DIR)/living-worlds.dfs
 
 clean:

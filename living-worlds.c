@@ -63,12 +63,14 @@
 #define TITLE_FADE_S  0.6f
 #define TITLE_VIG_A   160       /* peak vignette alpha (0..255) */
 
-/* Menu panel: 320x320 centered on 640x480. */
-#define MENU_X0       160
-#define MENU_Y0       80
-#define MENU_X1       480
-#define MENU_Y1       400
-#define MENU_PAD      18        /* inner padding (px) */
+/* Menu panel: 360x360 centered on 640x480. Width sized to fit the longest
+ * scene title ("Early October - Haunted Ruins - Clear", 37 chars) on a
+ * single line in the 8px-mono font with margin to spare. */
+#define MENU_X0       140
+#define MENU_Y0       60
+#define MENU_X1       500
+#define MENU_Y1       420
+#define MENU_PAD      14        /* inner padding (px) */
 #define MENU_ROW_H    24        /* row spacing */
 #define MENU_PANEL_A  190       /* panel alpha (0..255) */
 
@@ -521,21 +523,6 @@ static const char *time_src_label(void)
     }
 }
 
-/* Strip the leading "NN_" and trailing "_clear"/"_cloudy"/"_rain" decoration
- * from a scene slug so the menu shows e.g. "mar monolith plains" instead of
- * "05_mar_monolith_plains_clear". */
-static void scene_short_name(char *out, size_t cap)
-{
-    const char *p = strrchr(scene_paths[scene_idx], '/');
-    p = p ? p + 1 : scene_paths[scene_idx];
-    while (*p && (*p == '_' || (*p >= '0' && *p <= '9'))) p++;
-    snprintf(out, cap, "%s", p);
-    char *dot = strrchr(out, '.');
-    if (dot) *dot = 0;
-    /* underscores -> spaces for readability */
-    for (char *q = out; *q; q++) if (*q == '_') *q = ' ';
-}
-
 static void draw_menu(void)
 {
     /* Panel: translucent dark fill, then a thin light frame. */
@@ -558,24 +545,21 @@ static void draw_menu(void)
     rdpq_text_printf(NULL, FONT_HUD, label_x, y, "Living Worlds");
     y += MENU_ROW_H;
     rdpq_text_printf(NULL, FONT_HUD, label_x, y,
-        "------------------------");
+        "----------------------------------------");
     y += MENU_ROW_H;
-
-    char scene_name[64];
-    scene_short_name(scene_name, sizeof(scene_name));
 
     int t = (int)time_of_day;
     int hh = t / 3600, mm = (t / 60) % 60;
 
-    /* Per-row labels and values. The focused row is drawn in style 1
-     * (yellow) via the ^01 / ^00 escape codes; the focus cursor "> " is
-     * printed in the label column. */
+    /* Per-row labels and values for the single-line rows. ROW_SCENE is
+     * handled specially below so its (potentially long) title can have a
+     * whole line to itself. */
     const char *labels[ROW_COUNT] = {
         "Scene", "Cycling", "BlendShift", "Time source",
         "Time of day", "Sound",
     };
     char values[ROW_COUNT][32];
-    snprintf(values[ROW_SCENE],       sizeof(values[0]), "< %.20s >", scene_name);
+    values[ROW_SCENE][0] = 0;   /* unused */
     snprintf(values[ROW_CYCLING],     sizeof(values[0]), "[%s]", cycling    ? "ON" : "OFF");
     snprintf(values[ROW_BLENDSHIFT],  sizeof(values[0]), "[%s]", blendshift ? "ON" : "OFF");
     snprintf(values[ROW_TIME_SOURCE], sizeof(values[0]), "< %s >", time_src_label());
@@ -586,6 +570,22 @@ static void draw_menu(void)
         bool focused = (i == menu_focus);
         const char *style_open  = focused ? "^01" : "";
         const char *style_close = focused ? "^00" : "";
+
+        if (i == ROW_SCENE) {
+            /* Two-line layout: "> Scene  N/M" then "  < Title >" indented
+             * underneath, so the full hdr->title is visible regardless of
+             * length. Both lines share the focused style when selected. */
+            rdpq_text_printf(NULL, FONT_HUD, label_x, y,
+                "%s%s Scene  %d/%d%s",
+                style_open, focused ? ">" : " ",
+                scene_idx + 1, scene_count, style_close);
+            y += MENU_ROW_H;
+            rdpq_text_printf(NULL, FONT_HUD, label_x + 16, y,
+                "%s< %s >%s", style_open, hdr->title, style_close);
+            y += MENU_ROW_H;
+            continue;
+        }
+
         rdpq_text_printf(NULL, FONT_HUD, label_x, y,
             "%s%s %s%s", style_open, focused ? ">" : " ", labels[i], style_close);
         rdpq_text_printf(NULL, FONT_HUD, value_x, y,
@@ -596,15 +596,15 @@ static void draw_menu(void)
     /* Status footer + dismiss hint. */
     y += 6;
     rdpq_text_printf(NULL, FONT_HUD, label_x, y,
-        "------------------------");
+        "----------------------------------------");
     y += MENU_ROW_H;
     rdpq_text_printf(NULL, FONT_HUD, label_x, y,
         "Audio: %.10s  RTC: %s",
         hdr->audio_slug[0] ? hdr->audio_slug : "(none)",
-        rtc_present ? "yes" : "soft");
+        rtc_present ? "Available" : "Software");
     y += MENU_ROW_H;
     rdpq_text_printf(NULL, FONT_HUD, label_x, y,
-        "Start: close");
+        "Start: Close Menu");
 }
 
 static void menu_change(int row, int dir)

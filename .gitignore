@@ -4,6 +4,8 @@
 /sounds/
 *.z64
 *.pak
+*.eeprom
+*.rtc
 *.webarchive
 __pycache__/
 .DS_Store
