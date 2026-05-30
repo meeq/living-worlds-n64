@@ -14,16 +14,24 @@
  *     timeline palettes bracketing the current time (the reference's
  *     setTimeOfDayPalette + Palette.fade). Cycling is then layered on top.
  *
- * The day clock has three sources, cycled with C-up: AUTO (advances ~24 min per
- * simulated day, like the reference), RTC (follows the hardware/software clock
- * via the RTC subsystem), and HOLD (frozen). C-left/C-right scrub time by hand.
+ * The day clock has three sources: AUTO (advances ~24 min per simulated day,
+ * like the reference), RTC (follows the hardware/software clock via the RTC
+ * subsystem), and HOLD (frozen). All three, plus a manual scrub, are exposed
+ * through the in-game menu.
  *
  * Each scene also references an ambient audio loop (rom:/<slug>.wav64, streamed
  * by libdragon's wav64 module) with a per-scene max volume. On scene change the
  * outgoing loop fades out (~0.4 s) while the new one fades in (~2 s), matching
- * the reference's startSceneAudio / stopSceneAudio. C-down toggles sound; pause
- * and the global mute both gate per-channel volumes to zero without disturbing
- * the underlying stream positions, so resuming is seamless.
+ * the reference's startSceneAudio / stopSceneAudio. The menu's Sound row gates
+ * per-channel volumes to zero without disturbing the underlying stream
+ * positions, so resuming is seamless.
+ *
+ * The front end is a tiny state machine: UI_TITLE shows a credits overlay over
+ * the live first scene and fades out on any button (or after 10 s); UI_SCENE is
+ * the bare scene with no overlay; UI_MENU is a translucent panel of focusable
+ * rows (Scene, Cycling, BlendShift, Time source, Time of day, Sound) navigated
+ * with the D-pad or analog stick. Start toggles into and out of the menu; no
+ * other bindings exist outside it.
  *
  * Asset: rom:/ *.lw (format LWL3), produced by tools/convert_scene.py.
  */
@@ -45,6 +53,24 @@
 #define MAX_COLORS    256
 #define MAX_SCENES    32
 #define FONT_HUD      1
+#define FONT_TITLE    2
+
+/* Title screen: ~600 px text band centered on a 640 px screen, dark-vignetted
+ * over the live scene, fading out at TITLE_FADE_S either on any-button or
+ * after TITLE_HOLD_S of inactivity. Pressing Start jumps straight to the menu
+ * instead. */
+#define TITLE_HOLD_S  10.0f
+#define TITLE_FADE_S  0.6f
+#define TITLE_VIG_A   160       /* peak vignette alpha (0..255) */
+
+/* Menu panel: 320x320 centered on 640x480. */
+#define MENU_X0       160
+#define MENU_Y0       80
+#define MENU_X1       480
+#define MENU_Y1       400
+#define MENU_PAD      18        /* inner padding (px) */
+#define MENU_ROW_H    24        /* row spacing */
+#define MENU_PANEL_A  190       /* panel alpha (0..255) */
 
 /* Audio: 48 kHz mono, two mixer channels (current loop + crossfading
  * predecessor), Opus-compressed wav64 streamed directly from ROM. Opus only
@@ -103,13 +129,32 @@ static int       scene_idx;
 /* runtime state */
 static bool       cycling     = true;
 static bool       blendshift  = true;
-static bool       paused      = false;
-static bool       show_hud    = true;
 static bool       sound_on    = true;
 static uint32_t   scene_ms    = 0;             /* pausable clock driving the cycling */
 static float      time_of_day = SECS_MID_DAY;  /* seconds since midnight, [0, 86400) */
 static time_src_t time_src    = TIME_AUTO;
 static bool       rtc_present = false;
+
+/* UI state. The demo boots into UI_TITLE (credits overlaid on the live
+ * scene), drops to UI_SCENE (bare scene, no HUD) after the title fades, and
+ * toggles to UI_MENU on Start. The scene keeps animating in every state. */
+typedef enum { UI_TITLE, UI_SCENE, UI_MENU } ui_state_t;
+
+typedef enum {
+    ROW_SCENE,
+    ROW_CYCLING,
+    ROW_BLENDSHIFT,
+    ROW_TIME_SOURCE,
+    ROW_TIME_OF_DAY,
+    ROW_SOUND,
+    ROW_COUNT
+} menu_row_t;
+
+static ui_state_t ui_state      = UI_TITLE;
+static float      title_alpha   = 1.0f;        /* 1.0 visible, 0.0 gone */
+static float      title_t       = 0.0f;        /* seconds in UI_TITLE */
+static bool       title_dismiss = false;       /* fade-out requested */
+static int        menu_focus    = ROW_SCENE;
 
 /* wav64 cache: open each unique slug at most once and stream from ROM. */
 static char    wav_slugs[MAX_AUDIO_SLUGS][SLUG_MAX];
@@ -284,8 +329,8 @@ static wav64_t *audio_get(const char *slug)
 }
 
 /* Step `ch_vol[ch]` toward `ch_target[ch]` at `ch_rate[ch]` and push the
- * (sound_on/!paused-gated) volume to the mixer. Stops the channel when an
- * outgoing fade reaches zero. */
+ * sound_on-gated volume to the mixer. Stops the channel when an outgoing
+ * fade reaches zero. */
 static void update_channel(int ch, float dt)
 {
     if (!ch_slug[ch]) return;
@@ -296,7 +341,7 @@ static void update_channel(int ch, float dt)
         else
             ch_vol[ch] = (ch_vol[ch] - step < ch_target[ch]) ? ch_target[ch] : ch_vol[ch] - step;
     }
-    float gated = (sound_on && !paused) ? ch_vol[ch] : 0.0f;
+    float gated = sound_on ? ch_vol[ch] : 0.0f;
     mixer_ch_set_vol(ch, gated, gated);
     if (ch_vol[ch] == 0.0f && ch_target[ch] == 0.0f) {
         mixer_ch_stop(ch);
@@ -353,25 +398,213 @@ static void start_scene_audio(const char *slug, float max_vol)
     }
 }
 
-static void draw_hud(void)
+/* Fill a rectangle with a flat (combiner) color, blending against the
+ * framebuffer via the prim alpha. Caller must call rdpq_set_mode_standard()
+ * again before resuming normal sprite/text draws. */
+static void fill_rect_alpha(int x0, int y0, int x1, int y1, color_t c)
 {
+    rdpq_set_mode_standard();
+    rdpq_mode_combiner(RDPQ_COMBINER_FLAT);
+    rdpq_mode_blender(RDPQ_BLENDER_MULTIPLY);
+    rdpq_set_prim_color(c);
+    rdpq_fill_rectangle(x0, y0, x1, y1);
+}
+
+/* Re-style FONT_TITLE so its color/outline alpha tracks the title fade. */
+static void title_set_alpha(float a)
+{
+    uint8_t aa = (uint8_t)(a * 255.0f);
+    rdpq_font_t *f = (rdpq_font_t *)rdpq_text_get_font(FONT_TITLE);
+    rdpq_font_style(f, 0, &(rdpq_fontstyle_t){
+        .color         = RGBA32(255, 255, 255, aa),
+        .outline_color = RGBA32(0,   0,   0,   aa),
+    });
+}
+
+static void draw_title(float alpha)
+{
+    if (alpha <= 0.0f) return;
+
+    /* Vignette over the live scene. */
+    fill_rect_alpha(0, 0, 640, 480,
+        RGBA32(0, 0, 0, (uint8_t)(TITLE_VIG_A * alpha)));
+
+    title_set_alpha(alpha);
+
+    rdpq_textparms_t centered = { .width = 640, .align = ALIGN_CENTER };
+
+    rdpq_text_printf(&centered, FONT_TITLE, 0, 170, "LIVING WORLDS");
+    rdpq_text_printf(&centered, FONT_TITLE, 0, 230,
+        "Color-cycling pixel art by Mark Ferrari");
+    rdpq_text_printf(&centered, FONT_TITLE, 0, 250,
+        "Original code by Ian Gilman and Joseph Huckaby");
+    rdpq_text_printf(&centered, FONT_TITLE, 0, 270,
+        "N64 port by Christopher Bonhage");
+    rdpq_text_printf(&centered, FONT_TITLE, 0, 430,
+        "Press Start for Options");
+}
+
+static const char *time_src_label(void)
+{
+    switch (time_src) {
+        case TIME_AUTO: return "AUTO";
+        case TIME_RTC:  return rtc_present ? "RTC" : "RTC*";
+        default:        return "HOLD";
+    }
+}
+
+/* Strip the leading "NN_" and trailing "_clear"/"_cloudy"/"_rain" decoration
+ * from a scene slug so the menu shows e.g. "mar monolith plains" instead of
+ * "05_mar_monolith_plains_clear". */
+static void scene_short_name(char *out, size_t cap)
+{
+    const char *p = strrchr(scene_paths[scene_idx], '/');
+    p = p ? p + 1 : scene_paths[scene_idx];
+    while (*p && (*p == '_' || (*p >= '0' && *p <= '9'))) p++;
+    snprintf(out, cap, "%s", p);
+    char *dot = strrchr(out, '.');
+    if (dot) *dot = 0;
+    /* underscores -> spaces for readability */
+    for (char *q = out; *q; q++) if (*q == '_') *q = ' ';
+}
+
+static void draw_menu(void)
+{
+    /* Panel: translucent dark fill, then a thin light frame. */
+    fill_rect_alpha(MENU_X0, MENU_Y0, MENU_X1, MENU_Y1,
+        RGBA32(0, 0, 0, MENU_PANEL_A));
+    color_t edge = RGBA32(255, 255, 255, 220);
+    fill_rect_alpha(MENU_X0,     MENU_Y0,     MENU_X1,     MENU_Y0 + 2, edge);
+    fill_rect_alpha(MENU_X0,     MENU_Y1 - 2, MENU_X1,     MENU_Y1,     edge);
+    fill_rect_alpha(MENU_X0,     MENU_Y0,     MENU_X0 + 2, MENU_Y1,     edge);
+    fill_rect_alpha(MENU_X1 - 2, MENU_Y0,     MENU_X1,     MENU_Y1,     edge);
+
+    /* Re-enter standard mode so the font path picks a sane combiner. */
+    rdpq_set_mode_standard();
+
+    const int label_x = MENU_X0 + MENU_PAD;        /* left column */
+    const int value_x = MENU_X0 + 160;             /* right column */
+    int       y       = MENU_Y0 + MENU_PAD + 18;
+
+    /* Header. */
+    rdpq_text_printf(NULL, FONT_HUD, label_x, y, "Living Worlds");
+    y += MENU_ROW_H;
+    rdpq_text_printf(NULL, FONT_HUD, label_x, y,
+        "------------------------");
+    y += MENU_ROW_H;
+
+    char scene_name[64];
+    scene_short_name(scene_name, sizeof(scene_name));
+
     int t = (int)time_of_day;
     int hh = t / 3600, mm = (t / 60) % 60;
-    const char *src =
-        time_src == TIME_AUTO ? "auto" :
-        time_src == TIME_RTC  ? (rtc_present ? "rtc" : "rtc(soft)") : "hold";
 
-    rdpq_text_printf(NULL, FONT_HUD, 8, 14,
-        "%s  [%d/%d]", hdr->title, scene_idx + 1, scene_count);
-    rdpq_text_printf(NULL, FONT_HUD, 8, 26,
-        "%02d:%02d %s  cycle:%s blend:%s snd:%s%s",
-        hh, mm, src,
-        cycling ? "on" : "off",
-        blendshift ? "on" : "off",
-        sound_on  ? (hdr->audio_slug[0] ? hdr->audio_slug : "off") : "off",
-        paused ? "  PAUSED" : "");
-    rdpq_text_printf(NULL, FONT_HUD, 8, 38,
-        "A:cyc B:bld C<>:scrub Cup:time Cdn:snd St:pause L/R:scene Z:hud");
+    /* Per-row labels and values. The focused row is drawn in style 1
+     * (yellow) via the ^01 / ^00 escape codes; the focus cursor "> " is
+     * printed in the label column. */
+    const char *labels[ROW_COUNT] = {
+        "Scene", "Cycling", "BlendShift", "Time source",
+        "Time of day", "Sound",
+    };
+    char values[ROW_COUNT][32];
+    snprintf(values[ROW_SCENE],       sizeof(values[0]), "< %.20s >", scene_name);
+    snprintf(values[ROW_CYCLING],     sizeof(values[0]), "[%s]", cycling    ? "ON" : "OFF");
+    snprintf(values[ROW_BLENDSHIFT],  sizeof(values[0]), "[%s]", blendshift ? "ON" : "OFF");
+    snprintf(values[ROW_TIME_SOURCE], sizeof(values[0]), "< %s >", time_src_label());
+    snprintf(values[ROW_TIME_OF_DAY], sizeof(values[0]), "< %02d:%02d >", hh, mm);
+    snprintf(values[ROW_SOUND],       sizeof(values[0]), "[%s]", sound_on   ? "ON" : "OFF");
+
+    for (int i = 0; i < ROW_COUNT; i++) {
+        bool focused = (i == menu_focus);
+        const char *style_open  = focused ? "^01" : "";
+        const char *style_close = focused ? "^00" : "";
+        rdpq_text_printf(NULL, FONT_HUD, label_x, y,
+            "%s%s %s%s", style_open, focused ? ">" : " ", labels[i], style_close);
+        rdpq_text_printf(NULL, FONT_HUD, value_x, y,
+            "%s%s%s", style_open, values[i], style_close);
+        y += MENU_ROW_H;
+    }
+
+    /* Status footer + dismiss hint. */
+    y += 6;
+    rdpq_text_printf(NULL, FONT_HUD, label_x, y,
+        "------------------------");
+    y += MENU_ROW_H;
+    rdpq_text_printf(NULL, FONT_HUD, label_x, y,
+        "Audio: %.10s  RTC: %s",
+        hdr->audio_slug[0] ? hdr->audio_slug : "(none)",
+        rtc_present ? "yes" : "soft");
+    y += MENU_ROW_H;
+    rdpq_text_printf(NULL, FONT_HUD, label_x, y,
+        "Start: close");
+}
+
+static void menu_change(int row, int dir)
+{
+    switch (row) {
+        case ROW_SCENE:       switch_scene(dir); break;
+        case ROW_CYCLING:     cycling    = !cycling;    break;
+        case ROW_BLENDSHIFT:  blendshift = !blendshift; break;
+        case ROW_TIME_SOURCE: time_src   = (time_src + 3 + dir) % 3; break;
+        case ROW_TIME_OF_DAY:
+            /* Discrete nudge: 1 hour per press, force HOLD. */
+            time_of_day = fmodf(time_of_day + dir * 3600.0f + SECS_PER_DAY,
+                                (float)SECS_PER_DAY);
+            time_src = TIME_HOLD;
+            break;
+        case ROW_SOUND:       sound_on   = !sound_on;   break;
+    }
+}
+
+static void menu_activate(int row)
+{
+    switch (row) {
+        case ROW_SCENE:       switch_scene(+1); break;
+        case ROW_TIME_OF_DAY: /* no toggle for scrub-only row */ break;
+        default:              menu_change(row, +1); break;
+    }
+}
+
+/* Per-frame menu input. Returns true if the menu should close. `dt` drives
+ * the analog-stick scrub on the Time of day row. */
+static bool menu_handle_input(joypad_buttons_t pressed, float dt)
+{
+    if (pressed.start) return true;
+
+    /* Vertical nav: D-pad edges + analog stick Y edges (libdragon gives us
+     * D-pad-equivalent press/held events for the stick). */
+    int dy = 0;
+    if (pressed.d_up)   dy--;
+    if (pressed.d_down) dy++;
+    int sy = joypad_get_axis_pressed(JOYPAD_PORT_1, JOYPAD_AXIS_STICK_Y);
+    /* Stick Y is positive-up in libdragon, so invert to match d_down=+1. */
+    dy -= sy;
+    if (dy) menu_focus = (menu_focus + ROW_COUNT + (dy > 0 ? 1 : -1)) % ROW_COUNT;
+
+    /* Horizontal change on focused row. */
+    int dx = 0;
+    if (pressed.d_left)  dx--;
+    if (pressed.d_right) dx++;
+    dx += joypad_get_axis_pressed(JOYPAD_PORT_1, JOYPAD_AXIS_STICK_X);
+    if (dx) menu_change(menu_focus, dx > 0 ? +1 : -1);
+
+    if (pressed.a) menu_activate(menu_focus);
+
+    /* Hold-to-scrub when the Time of day row is focused. Mirrors the old
+     * C-left/C-right behaviour: scrub forces TIME_HOLD so the value sticks. */
+    if (menu_focus == ROW_TIME_OF_DAY) {
+        int hx = 0;
+        joypad_buttons_t held = joypad_get_buttons_held(JOYPAD_PORT_1);
+        if (held.d_left)  hx--;
+        if (held.d_right) hx++;
+        hx += joypad_get_axis_held(JOYPAD_PORT_1, JOYPAD_AXIS_STICK_X);
+        if (hx) {
+            time_of_day += hx * SCRUB_RATE * dt;
+            time_src = TIME_HOLD;
+        }
+    }
+
+    return false;
 }
 
 int main(void)
@@ -402,37 +635,68 @@ int main(void)
     load_scene(scene_paths[scene_idx]);
     start_scene_audio(hdr->audio_slug, hdr->audio_volume_q8 / 256.0f);
 
-    rdpq_text_register_font(FONT_HUD, rdpq_font_load_builtin(FONT_BUILTIN_DEBUG_MONO));
+    /* Two fonts: the small mono font (existing) is the menu's body text; the
+     * variable-width debug font is reserved for the title credits. Style 0 on
+     * FONT_HUD is the default white-on-black; style 1 is the focused-row
+     * yellow. Selected mid-string with the ^00 / ^01 escapes from rdpq_text. */
+    rdpq_font_t *f_hud = rdpq_font_load_builtin(FONT_BUILTIN_DEBUG_MONO);
+    rdpq_font_style(f_hud, 0, &(rdpq_fontstyle_t){
+        .color = RGBA32(240, 240, 240, 255), .outline_color = RGBA32(0, 0, 0, 255),
+    });
+    rdpq_font_style(f_hud, 1, &(rdpq_fontstyle_t){
+        .color = RGBA32(255, 220,  80, 255), .outline_color = RGBA32(0, 0, 0, 255),
+    });
+    rdpq_text_register_font(FONT_HUD, f_hud);
+
+    rdpq_font_t *f_title = rdpq_font_load_builtin(FONT_BUILTIN_DEBUG_VAR);
+    rdpq_text_register_font(FONT_TITLE, f_title);
+    title_set_alpha(1.0f);
 
     uint32_t last = get_ticks_ms();
     while (1) {
         joypad_poll();
         joypad_buttons_t pressed = joypad_get_buttons_pressed(JOYPAD_PORT_1);
-        joypad_buttons_t held    = joypad_get_buttons_held(JOYPAD_PORT_1);
-        if (pressed.a)      cycling    = !cycling;
-        if (pressed.b)      blendshift = !blendshift;
-        if (pressed.start)  paused     = !paused;
-        if (pressed.z)      show_hud   = !show_hud;
-        if (pressed.c_up)   time_src   = (time_src + 1) % 3;
-        if (pressed.c_down) sound_on   = !sound_on;
-        if (pressed.l)      switch_scene(-1);
-        if (pressed.r)      switch_scene(+1);
 
         uint32_t now = get_ticks_ms();
         uint32_t dms = now - last;
         last = now;
         float dt = dms / 1000.0f;
-        if (!paused) scene_ms += dms;
 
-        /* Advance the day clock. Scrubbing always wins and "grabs" the clock out
-         * of RTC mode so the scrubbed time sticks. */
-        if (held.c_left || held.c_right) {
-            time_of_day += (held.c_right ? SCRUB_RATE : -SCRUB_RATE) * dt;
-            if (time_src == TIME_RTC) time_src = TIME_HOLD;
-        } else if (!paused) {
-            if (time_src == TIME_AUTO)      time_of_day += SIM_RATE * dt;
-            else if (time_src == TIME_RTC)  time_of_day = rtc_seconds_of_day();
+        /* Per-state input. Only Start has any effect outside the menu;
+         * everything else routes through menu_handle_input(). */
+        switch (ui_state) {
+            case UI_TITLE:
+                title_t += dt;
+                if (title_t >= TITLE_HOLD_S) title_dismiss = true;
+                if (pressed.start) {
+                    ui_state      = UI_MENU;
+                    title_alpha   = 0.0f;
+                    title_dismiss = false;
+                } else if (pressed.raw) {
+                    title_dismiss = true;
+                }
+                if (title_dismiss) {
+                    title_alpha -= dt / TITLE_FADE_S;
+                    if (title_alpha <= 0.0f) {
+                        title_alpha = 0.0f;
+                        ui_state    = UI_SCENE;
+                    }
+                }
+                break;
+            case UI_SCENE:
+                if (pressed.start) ui_state = UI_MENU;
+                break;
+            case UI_MENU:
+                if (menu_handle_input(pressed, dt)) ui_state = UI_SCENE;
+                break;
         }
+
+        scene_ms += dms;
+
+        /* Day clock. AUTO advances at SIM_RATE; RTC tracks the real clock;
+         * HOLD freezes (and is also where manual scrub leaves us). */
+        if (time_src == TIME_AUTO)      time_of_day += SIM_RATE * dt;
+        else if (time_src == TIME_RTC)  time_of_day = rtc_seconds_of_day();
         time_of_day = fmodf(time_of_day, (float)SECS_PER_DAY);
         if (time_of_day < 0) time_of_day += SECS_PER_DAY;
 
@@ -452,7 +716,8 @@ int main(void)
         rdpq_tex_upload_tlut(tlut, 0, hdr->num_colors);
         rdpq_tex_blit(&idx_surf, 0, 0, NULL);
 
-        if (show_hud) draw_hud();
+        if      (ui_state == UI_TITLE) draw_title(title_alpha);
+        else if (ui_state == UI_MENU)  draw_menu();
 
         mixer_try_play();
         rdpq_detach_show();
