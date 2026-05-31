@@ -51,7 +51,12 @@ filesystem/%.wav64: sounds/%.mp3
 	@$(N64_AUDIOCONV) --wav-mono --wav-compress 3 \
 	    --wav-loop true -o $(dir $@) $< >/dev/null
 
-$(BUILD_DIR)/living-worlds.dfs: $(assets_lw) $(assets_wav)
+filesystem/buttons.sprite: buttons.png
+	@mkdir -p $(dir $@)
+	@echo "    [SPRITE] $@"
+	@$(N64_INST)/bin/mksprite --format RGBA16 --output $(dir $@) $< >/dev/null
+
+$(BUILD_DIR)/living-worlds.dfs: $(assets_lw) $(assets_wav) filesystem/buttons.sprite
 $(BUILD_DIR)/living-worlds.elf: $(src:%.c=$(BUILD_DIR)/%.o)
 
 living-worlds.z64: N64_ROM_TITLE="Living Worlds"

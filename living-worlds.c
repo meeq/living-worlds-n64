@@ -39,7 +39,9 @@
 #include <libdragon.h>
 #include <malloc.h>
 #include <math.h>
+#include <stdarg.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
@@ -48,12 +50,30 @@
 #define CYCLE_SPEED   280.0f    /* matches the reference engine (palette.js) */
 #define SECS_PER_DAY  86400
 #define SECS_MID_DAY (SECS_PER_DAY / 2)
-#define SIM_RATE      60.0f     /* simulated seconds per real second (~24 min/day) */
-#define SCRUB_RATE    10800.0f  /* scrub speed while C-left/right held (3 h/s) */
+/* AUTO speed is parameterised by real-time day length (how long a full
+ * simulated day takes in real seconds): every preset is a clean round
+ * duration, and adjacent steps roughly halve. Default is 1 min/day -- a
+ * lively-but-watchable pace; anything longer drags. */
+static const int DAY_SPEED_SECS[] = { 1200, 600, 300, 120, 60, 30, 15 };
+#define DAY_SPEED_N        (sizeof(DAY_SPEED_SECS) / sizeof(DAY_SPEED_SECS[0]))
+#define DAY_SPEED_DEFAULT  4    /* 60s -- 1 minute per simulated day */
+#define SCRUB_RATE       10800.0f  /* scrub speed while C-left/right held (3 h/s) */
 #define MAX_COLORS    256
 #define MAX_SCENES    32
 #define FONT_HUD      1
 #define FONT_TITLE    2
+
+/* Button-icon spritemap: 48x48 PNG arranged as a 4x4 grid of 12x12 cells
+ * (rom:/buttons.sprite). Row-major btn_t indices below. The icons take the
+ * place of "L/Z", "Start/A", "C-Up", etc. in the menu cheat sheet, and the
+ * Start icon also appears on the title-screen prompt. */
+#define BTN_SIZE      12
+typedef enum {
+    BTN_D_UP,    BTN_D_RIGHT, BTN_D_LEFT, BTN_D_DOWN,
+    BTN_L,       BTN_Z,       BTN_R,      BTN_DPAD,
+    BTN_A,       BTN_B,       BTN_START,  BTN_CTRL,
+    BTN_C_UP,    BTN_C_RIGHT, BTN_C_LEFT, BTN_C_DOWN,
+} btn_t;
 
 /* Title screen: ~600 px text band centered on a 640 px screen, dark-vignetted
  * over the live scene, fading out at TITLE_FADE_S either on any-button or
@@ -63,13 +83,22 @@
 #define TITLE_FADE_S  0.6f
 #define TITLE_VIG_A   160       /* peak vignette alpha (0..255) */
 
-/* Menu panel: 360x360 centered on 640x480. Width sized to fit the longest
- * scene title ("Early October - Haunted Ruins - Clear", 37 chars) on a
- * single line in the 8px-mono font with margin to spare. */
+/* Action toast: one-line confirmation in the bottom-right corner whenever an
+ * off-menu binding fires. Anchored inside a ~10% NTSC action-safe inset so it
+ * stays visible on overscanning CRTs. Re-styled per-frame on FONT_HUD style 2
+ * so the color/outline alpha can track the fade. */
+#define TOAST_HOLD_S     1.5f
+#define TOAST_FADE_S     0.4f
+#define TOAST_STYLE      2
+#define TOAST_SAFE_R     32     /* right action-safe inset (px) */
+#define TOAST_SAFE_B     32     /* bottom action-safe inset (px) */
+
+/* Menu panel: 360 px wide, centered on 640x480, sized to fit header + 7 rows
+ * + 3-line cheat sheet with the bottom edge well inside the NTSC action-safe */
 #define MENU_X0       140
 #define MENU_Y0       60
 #define MENU_X1       500
-#define MENU_Y1       420
+#define MENU_Y1       410
 #define MENU_PAD      14        /* inner padding (px) */
 #define MENU_ROW_H    24        /* row spacing */
 #define MENU_PANEL_A  190       /* panel alpha (0..255) */
@@ -126,15 +155,20 @@ typedef union {
 _Static_assert(sizeof(lw_save_flags_t) == 1, "lw_save_flags_t must pack into a single byte");
 
 typedef struct {
-    char            magic[4];        /* "LWS1" */
+    char            magic[4];        /* "LWS2" (was "LWS1" before day_speed_idx) */
     lw_save_flags_t flags;
     uint8_t         time_src;        /* time_src_t value */
     uint8_t         scene_idx;       /* index into the sorted scene catalog */
-    uint8_t         pad;
+    uint8_t         day_speed_idx;    /* index into DAY_SPEED_SECS (LWS1 carts: ignored, defaults to DAY_SPEED_DEFAULT) */
     uint32_t        time_of_day_s;   /* seconds since midnight; only meaningful when time_src == TIME_HOLD */
     uint32_t        reserved;
 } lw_save_t;                         /* sizeof == 16 */
 _Static_assert(sizeof(lw_save_t) == 16, "lw_save_t must be 16 bytes (2 EEPROM blocks)");
+
+/* button icon spritemap loaded from rom:/buttons.sprite */
+static sprite_t *btn_sprite;
+static int       title_press_w;   /* "Press " width in FONT_TITLE (px) */
+static int       title_options_w; /* " for Options" width in FONT_TITLE (px) */
 
 /* working buffers */
 static surface_t idx_surf;            /* FMT_CI8 view over the full-res pixel bytes */
@@ -162,6 +196,7 @@ static bool       sound_on    = true;
 static uint32_t   scene_ms    = 0;             /* pausable clock driving the cycling */
 static float      time_of_day = SECS_MID_DAY;  /* seconds since midnight, [0, 86400) */
 static time_src_t time_src    = TIME_AUTO;
+static int        day_speed_idx = DAY_SPEED_DEFAULT;
 static bool       rtc_present = false;
 
 /* UI state. The demo boots into UI_TITLE (credits overlaid on the live
@@ -171,11 +206,12 @@ typedef enum { UI_TITLE, UI_SCENE, UI_MENU } ui_state_t;
 
 typedef enum {
     ROW_SCENE,
+    ROW_SOUND,
     ROW_CYCLING,
     ROW_BLENDSHIFT,
     ROW_TIME_SOURCE,
+    ROW_SPEED,
     ROW_TIME_OF_DAY,
-    ROW_SOUND,
     ROW_COUNT
 } menu_row_t;
 
@@ -185,6 +221,8 @@ static float      title_t       = 0.0f;        /* seconds in UI_TITLE */
 static bool       title_dismiss = false;       /* fade-out requested */
 static int        menu_focus    = ROW_SCENE;
 static bool       save_dirty    = false;       /* pending EEPROM flush */
+static char       toast_msg[64] = "";
+static float      toast_t       = TOAST_HOLD_S + TOAST_FADE_S;  /* start hidden */
 
 /* wav64 cache: open each unique slug at most once and stream from ROM. */
 static char    wav_slugs[MAX_AUDIO_SLUGS][SLUG_MAX];
@@ -436,7 +474,9 @@ static void save_load(void)
     if (eeprom_present() == EEPROM_NONE) return;
     lw_save_t s;
     eeprom_read_bytes(&s, 0, sizeof(s));
-    if (memcmp(s.magic, "LWS1", 4) != 0) return;
+    bool lws2 = memcmp(s.magic, "LWS2", 4) == 0;
+    bool lws1 = memcmp(s.magic, "LWS1", 4) == 0;
+    if (!lws1 && !lws2) return;
 
     cycling    = s.flags.cycling;
     blendshift = s.flags.blendshift;
@@ -444,6 +484,9 @@ static void save_load(void)
     if (s.time_src <= TIME_HOLD)             time_src    = (time_src_t)s.time_src;
     if (s.scene_idx < (unsigned)scene_count) scene_idx   = s.scene_idx;
     if (s.time_of_day_s < SECS_PER_DAY)      time_of_day = (float)s.time_of_day_s;
+    /* LWS1 carts left this byte as pad (zero), which would resolve to the slowest
+     * preset rather than the intended 60x default — ignore it for legacy saves. */
+    if (lws2 && s.day_speed_idx < DAY_SPEED_N) day_speed_idx = s.day_speed_idx;
 }
 
 /* Serialize the current settings into 2 EEPROM blocks. libdragon writes
@@ -457,11 +500,11 @@ static void save_flush(void)
     if (eeprom_present() == EEPROM_NONE) return;
 
     lw_save_t s = {
-        .magic         = { 'L', 'W', 'S', '1' },
+        .magic         = { 'L', 'W', 'S', '2' },
         .flags         = { .cycling = cycling, .blendshift = blendshift, .sound_on = sound_on },
         .time_src      = (uint8_t)time_src,
         .scene_idx     = (uint8_t)scene_idx,
-        .pad           = 0,
+        .day_speed_idx = (uint8_t)day_speed_idx,
         .time_of_day_s = (uint32_t)time_of_day,
         .reserved      = 0,
     };
@@ -491,6 +534,10 @@ static void title_set_alpha(float a)
     });
 }
 
+/* Forward declaration: draw_title embeds a Start icon in its prompt; the
+ * sprite helpers live further down with the menu code. */
+static void draw_btn_fade(int x, int y, btn_t b, float a);
+
 static void draw_title(float alpha)
 {
     if (alpha <= 0.0f) return;
@@ -510,8 +557,105 @@ static void draw_title(float alpha)
         "Original code by Ian Gilman and Joseph Huckaby");
     rdpq_text_printf(&centered, FONT_TITLE, 0, 270,
         "N64 port by Christopher Bonhage");
-    rdpq_text_printf(&centered, FONT_TITLE, 0, 430,
-        "Press Start for Options");
+    /* "Press [Start] for Options" with the Start button icon inline. The
+     * fragment widths were measured at startup; this just chains three left-
+     * aligned draws across a centered span. The icon uses draw_btn_fade so
+     * it dims in lockstep with the title text. */
+    int prompt_total = title_press_w + BTN_SIZE + title_options_w;
+    int prompt_x     = (640 - prompt_total) / 2;
+    rdpq_text_printf(NULL, FONT_TITLE, prompt_x, 430, "Press ");
+    draw_btn_fade(prompt_x + title_press_w, 430 - 9, BTN_START, alpha);
+    rdpq_text_printf(NULL, FONT_TITLE,
+        prompt_x + title_press_w + BTN_SIZE, 430, " for Options");
+}
+
+static void toast_show(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(toast_msg, sizeof(toast_msg), fmt, ap);
+    va_end(ap);
+    toast_t = 0.0f;
+}
+
+static float toast_alpha(void)
+{
+    if (toast_t <= TOAST_HOLD_S) return 1.0f;
+    float a = 1.0f - (toast_t - TOAST_HOLD_S) / TOAST_FADE_S;
+    return a < 0.0f ? 0.0f : a;
+}
+
+static void draw_toast(void)
+{
+    float a = toast_alpha();
+    if (a <= 0.0f || toast_msg[0] == 0) return;
+
+    uint8_t aa = (uint8_t)(a * 255.0f);
+    rdpq_font_t *f = (rdpq_font_t *)rdpq_text_get_font(FONT_HUD);
+    rdpq_font_style(f, TOAST_STYLE, &(rdpq_fontstyle_t){
+        .color         = RGBA32(255, 220,  80, aa),
+        .outline_color = RGBA32(0,   0,   0,   aa),
+    });
+
+    /* Right-align inside the action-safe column [TOAST_SAFE_R, 640 - TOAST_SAFE_R]
+     * with the baseline at 480 - TOAST_SAFE_B. The style escape lets us pick
+     * style 2 without a global font-style flip. */
+    rdpq_textparms_t parms = {
+        .width = 640 - 2 * TOAST_SAFE_R,
+        .align = ALIGN_RIGHT,
+        .style_id = TOAST_STYLE,
+    };
+    rdpq_text_printf(&parms, FONT_HUD, TOAST_SAFE_R, 480 - TOAST_SAFE_B,
+        "%s", toast_msg);
+}
+
+/* Blit one 12x12 cell out of the button spritemap. The icon at the requested
+ * btn_t maps row-major into the 4x4 grid of cells in btn_sprite. Resets RDP
+ * mode each call: the surrounding text renderer leaves the pipeline in a
+ * text-glyph mode that produces garbled output for raw sprite blits. */
+static void draw_btn(int x, int y, btn_t b)
+{
+    int col = (int)b & 3;
+    int row = (int)b >> 2;
+    rdpq_set_mode_standard();
+    rdpq_mode_tlut(TLUT_NONE);
+    rdpq_mode_blender(RDPQ_BLENDER_MULTIPLY);
+    rdpq_sprite_blit(btn_sprite, x, y, &(rdpq_blitparms_t){
+        .s0 = col * BTN_SIZE, .t0 = row * BTN_SIZE,
+        .width = BTN_SIZE,    .height = BTN_SIZE,
+    });
+}
+
+/* Faded variant of draw_btn used by the title-screen prompt: modulates the
+ * sprite RGBA by a prim color whose alpha is the fade level, so the icon
+ * fades in lockstep with the surrounding FONT_TITLE text. */
+static void draw_btn_fade(int x, int y, btn_t b, float a)
+{
+    uint8_t aa = (uint8_t)(a * 255.0f);
+    int col = (int)b & 3;
+    int row = (int)b >> 2;
+    rdpq_set_mode_standard();
+    rdpq_mode_tlut(TLUT_NONE);
+    rdpq_mode_combiner(RDPQ_COMBINER_TEX_FLAT);
+    rdpq_mode_blender(RDPQ_BLENDER_MULTIPLY);
+    rdpq_set_prim_color(RGBA32(255, 255, 255, aa));
+    rdpq_sprite_blit(btn_sprite, x, y, &(rdpq_blitparms_t){
+        .s0 = col * BTN_SIZE, .t0 = row * BTN_SIZE,
+        .width = BTN_SIZE,    .height = BTN_SIZE,
+    });
+}
+
+/* Format DAY_SPEED_SECS[idx] as a compact human label ("1h", "20m", "30s"). The
+ * preset table is hand-picked so every entry divides cleanly into hours,
+ * minutes, or seconds — no mixed-unit values like "1m30s" can appear. */
+static const char *day_speed_label(int idx)
+{
+    static char buf[16];
+    int s = DAY_SPEED_SECS[idx];
+    if      (s >= 3600 && s % 3600 == 0) snprintf(buf, sizeof(buf), "%dh", s / 3600);
+    else if (s >= 60   && s % 60   == 0) snprintf(buf, sizeof(buf), "%dm", s / 60);
+    else                                  snprintf(buf, sizeof(buf), "%ds", s);
+    return buf;
 }
 
 static const char *time_src_label(void)
@@ -521,6 +665,21 @@ static const char *time_src_label(void)
         case TIME_RTC:  return rtc_present ? "RTC" : "RTC*";
         default:        return "HOLD";
     }
+}
+
+/* One-token-at-a-time left-to-right layout for the cheat sheet rows. Each
+ * helper draws at x and returns the next x cursor. Icons sit 9 px above the
+ * text baseline so the 12 px sprite overlaps the 12 px line of mono text. */
+static int cheat_btn(int x, int y, btn_t b)
+{
+    draw_btn(x, y - 9, b);
+    return x + BTN_SIZE;
+}
+
+static int cheat_text(int x, int y, const char *s)
+{
+    rdpq_text_printf(NULL, FONT_HUD, x, y, "%s", s);
+    return x + (int)strlen(s) * 8;
 }
 
 static void draw_menu(void)
@@ -541,13 +700,6 @@ static void draw_menu(void)
     const int value_x = MENU_X0 + 160;             /* right column */
     int       y       = MENU_Y0 + MENU_PAD + 18;
 
-    /* Header. */
-    rdpq_text_printf(NULL, FONT_HUD, label_x, y, "Living Worlds");
-    y += MENU_ROW_H;
-    rdpq_text_printf(NULL, FONT_HUD, label_x, y,
-        "----------------------------------------");
-    y += MENU_ROW_H;
-
     int t = (int)time_of_day;
     int hh = t / 3600, mm = (t / 60) % 60;
 
@@ -555,14 +707,15 @@ static void draw_menu(void)
      * handled specially below so its (potentially long) title can have a
      * whole line to itself. */
     const char *labels[ROW_COUNT] = {
-        "Scene", "Cycling", "BlendShift", "Time source",
-        "Time of day", "Sound",
+        "Scene", "Sound", "Color Cycling", "Color Blending",
+        "Time Source", "AUTO Day Speed", "Time of Day",
     };
     char values[ROW_COUNT][32];
     values[ROW_SCENE][0] = 0;   /* unused */
     snprintf(values[ROW_CYCLING],     sizeof(values[0]), "[%s]", cycling    ? "ON" : "OFF");
     snprintf(values[ROW_BLENDSHIFT],  sizeof(values[0]), "[%s]", blendshift ? "ON" : "OFF");
     snprintf(values[ROW_TIME_SOURCE], sizeof(values[0]), "< %s >", time_src_label());
+    snprintf(values[ROW_SPEED],       sizeof(values[0]), "< %s >", day_speed_label(day_speed_idx));
     snprintf(values[ROW_TIME_OF_DAY], sizeof(values[0]), "< %02d:%02d >", hh, mm);
     snprintf(values[ROW_SOUND],       sizeof(values[0]), "[%s]", sound_on   ? "ON" : "OFF");
 
@@ -593,18 +746,52 @@ static void draw_menu(void)
         y += MENU_ROW_H;
     }
 
-    /* Status footer + dismiss hint. */
+    /* Off-menu controls cheat sheet. Heading announces what the icons mean
+     * (off-menu, not in-menu bindings); each row below is a left-to-right
+     * sequence of icon/text tokens via cheat_btn / cheat_text, with the
+     * helpers returning the next x cursor. Rows are sized to fit in the
+     * 332 px panel inner width (12 px icons, 8 px mono chars). */
     y += 6;
-    rdpq_text_printf(NULL, FONT_HUD, label_x, y,
-        "----------------------------------------");
+    rdpq_text_printf(NULL, FONT_HUD, label_x, y, "Controls (when menu is closed)");
     y += MENU_ROW_H;
-    rdpq_text_printf(NULL, FONT_HUD, label_x, y,
-        "Audio: %.10s  RTC: %s",
-        hdr->audio_slug[0] ? hdr->audio_slug : "(none)",
-        rtc_present ? "Available" : "Software");
+    int cx = label_x;
+    cx = cheat_btn (cx, y, BTN_L);
+    cx = cheat_text(cx, y, "/");
+    cx = cheat_btn (cx, y, BTN_Z);
+    cx = cheat_text(cx, y, ": Previous Scene  ");
+    cx = cheat_btn (cx, y, BTN_R);
+    cheat_text     (cx, y, ": Next Scene");
     y += MENU_ROW_H;
-    rdpq_text_printf(NULL, FONT_HUD, label_x, y,
-        "Start: Close Menu");
+
+    cx = label_x;
+    cx = cheat_btn (cx, y, BTN_START);
+    cx = cheat_text(cx, y, "/");
+    cx = cheat_btn (cx, y, BTN_A);
+    cx = cheat_text(cx, y, ": Menu  ");
+    cx = cheat_btn (cx, y, BTN_B);
+    cx = cheat_text(cx, y, ": Sound  ");
+    cx = cheat_btn (cx, y, BTN_D_UP);
+    cx = cheat_text(cx, y, "/");
+    cx = cheat_btn (cx, y, BTN_D_DOWN);
+    cheat_text     (cx, y, ": Speed");
+    y += MENU_ROW_H;
+
+    cx = label_x;
+    cx = cheat_btn (cx, y, BTN_C_UP);
+    cx = cheat_text(cx, y, ": Color Cycling  ");
+    cx = cheat_btn (cx, y, BTN_C_LEFT);
+    cx = cheat_text(cx, y, "/");
+    cx = cheat_btn (cx, y, BTN_C_RIGHT);
+    cheat_text     (cx, y, ": Time of Day");
+    y += MENU_ROW_H;
+
+    cx = label_x;
+    cx = cheat_btn (cx, y, BTN_C_DOWN);
+    cx = cheat_text(cx, y, ": Color Blending  ");
+    cx = cheat_btn (cx, y, BTN_D_LEFT);
+    cx = cheat_text(cx, y, "/");
+    cx = cheat_btn (cx, y, BTN_D_RIGHT);
+    cheat_text     (cx, y, ": Time Source");
 }
 
 static void menu_change(int row, int dir)
@@ -614,6 +801,7 @@ static void menu_change(int row, int dir)
         case ROW_CYCLING:     cycling    = !cycling;    break;
         case ROW_BLENDSHIFT:  blendshift = !blendshift; break;
         case ROW_TIME_SOURCE: time_src   = (time_src + 3 + dir) % 3; break;
+        case ROW_SPEED:       day_speed_idx = (day_speed_idx + DAY_SPEED_N + dir) % DAY_SPEED_N; break;
         case ROW_TIME_OF_DAY:
             /* Discrete nudge: 1 hour per press, force HOLD. */
             time_of_day = fmodf(time_of_day + dir * 3600.0f + SECS_PER_DAY,
@@ -638,7 +826,7 @@ static void menu_activate(int row)
  * the analog-stick scrub on the Time of day row. */
 static bool menu_handle_input(joypad_buttons_t pressed, float dt)
 {
-    if (pressed.start) return true;
+    if (pressed.start || pressed.b) return true;
 
     /* Vertical nav: D-pad edges + analog stick Y edges (libdragon gives us
      * D-pad-equivalent press/held events for the stick). */
@@ -672,6 +860,75 @@ static bool menu_handle_input(joypad_buttons_t pressed, float dt)
             time_src   = TIME_HOLD;
             save_dirty = true;
         }
+    }
+
+    return false;
+}
+
+/* Per-frame input when the menu is closed. Returns true to enter the menu.
+ * Each handled binding fires a bottom-right toast so the action is visible
+ * without opening the menu, and (where it changes persisted state) flips
+ * save_dirty so save_flush() picks it up next frame. */
+static bool scene_handle_input(joypad_buttons_t pressed, float dt)
+{
+    if (pressed.start || pressed.a) return true;
+
+    if (pressed.l || pressed.z) {
+        switch_scene(-1);
+        toast_show("< Scene %d/%d  %s", scene_idx + 1, scene_count, hdr->title);
+        save_dirty = true;
+        return false;
+    }
+    if (pressed.r) {
+        switch_scene(+1);
+        toast_show("Scene %d/%d >  %s", scene_idx + 1, scene_count, hdr->title);
+        save_dirty = true;
+        return false;
+    }
+
+    if (pressed.b) {
+        sound_on = !sound_on;
+        toast_show("Sound: %s", sound_on ? "ON" : "OFF");
+        save_dirty = true;
+    }
+    if (pressed.c_up) {
+        cycling = !cycling;
+        toast_show("Color Cycling: %s", cycling ? "ON" : "OFF");
+        save_dirty = true;
+    }
+    if (pressed.c_down) {
+        blendshift = !blendshift;
+        toast_show("Color Blending: %s", blendshift ? "ON" : "OFF");
+        save_dirty = true;
+    }
+
+    /* C-Left/Right scrubs time-of-day continuously while held (same SCRUB_RATE
+     * as the in-menu Time of Day row). Toast refreshes each frame so the HH:MM
+     * readout follows the scrub and stays visible until release. */
+    joypad_buttons_t held = joypad_get_buttons_held(JOYPAD_PORT_1);
+    int hx = (held.c_right ? 1 : 0) - (held.c_left ? 1 : 0);
+    if (hx) {
+        time_of_day = fmodf(time_of_day + hx * SCRUB_RATE * dt + SECS_PER_DAY,
+                            (float)SECS_PER_DAY);
+        time_src = TIME_HOLD;
+        int t = (int)time_of_day;
+        toast_show("Time of Day: %02d:%02d", t / 3600, (t / 60) % 60);
+        save_dirty = true;
+    }
+
+    int dx = (pressed.d_right ? 1 : 0) - (pressed.d_left ? 1 : 0);
+    if (dx) {
+        time_src = (time_src + 3 + dx) % 3;
+        toast_show("Time Source: %s", time_src_label());
+        save_dirty = true;
+    }
+
+    int dy = (pressed.d_down ? 1 : 0) - (pressed.d_up ? 1 : 0);
+    if (dy) {
+        day_speed_idx = (day_speed_idx + DAY_SPEED_N + dy) % DAY_SPEED_N;
+        time_src = TIME_AUTO;
+        toast_show("AUTO Day Speed: %s", day_speed_label(day_speed_idx));
+        save_dirty = true;
     }
 
     return false;
@@ -728,6 +985,26 @@ int main(void)
     rdpq_text_register_font(FONT_TITLE, f_title);
     title_set_alpha(1.0f);
 
+    btn_sprite = sprite_load("rom:/buttons.sprite");
+    assertf(btn_sprite, "could not load rom:/buttons.sprite");
+
+    /* Measure the two FONT_TITLE fragments straddling the title-screen Start
+     * icon. Layout once, cache the widths, free the layouts — draw_title
+     * uses them every frame to center "Press [Start] for Options" without
+     * any per-frame allocation. */
+    {
+        int n;
+        rdpq_paragraph_t *p;
+        n = strlen("Press ");
+        p = rdpq_paragraph_build(&(rdpq_textparms_t){0}, FONT_TITLE, "Press ", &n);
+        title_press_w = (int)p->advance_x;
+        rdpq_paragraph_free(p);
+        n = strlen(" for Options");
+        p = rdpq_paragraph_build(&(rdpq_textparms_t){0}, FONT_TITLE, " for Options", &n);
+        title_options_w = (int)p->advance_x;
+        rdpq_paragraph_free(p);
+    }
+
     uint32_t last = get_ticks_ms();
     while (1) {
         joypad_poll();
@@ -737,6 +1014,8 @@ int main(void)
         uint32_t dms = now - last;
         last = now;
         float dt = dms / 1000.0f;
+
+        toast_t += dt;
 
         /* Per-state input. Only Start has any effect outside the menu;
          * everything else routes through menu_handle_input(). */
@@ -760,7 +1039,7 @@ int main(void)
                 }
                 break;
             case UI_SCENE:
-                if (pressed.start) ui_state = UI_MENU;
+                if (scene_handle_input(pressed, dt)) ui_state = UI_MENU;
                 break;
             case UI_MENU:
                 if (menu_handle_input(pressed, dt)) ui_state = UI_SCENE;
@@ -769,9 +1048,9 @@ int main(void)
 
         scene_ms += dms;
 
-        /* Day clock. AUTO advances at SIM_RATE; RTC tracks the real clock;
-         * HOLD freezes (and is also where manual scrub leaves us). */
-        if (time_src == TIME_AUTO)      time_of_day += SIM_RATE * dt;
+        /* Day clock. AUTO advances at the selected SIM_RATES preset; RTC
+         * tracks the real clock; HOLD freezes (also where manual scrub leaves us). */
+        if (time_src == TIME_AUTO)      time_of_day += (float)SECS_PER_DAY * dt / (float)DAY_SPEED_SECS[day_speed_idx];
         else if (time_src == TIME_RTC)  time_of_day = rtc_seconds_of_day();
         time_of_day = fmodf(time_of_day, (float)SECS_PER_DAY);
         if (time_of_day < 0) time_of_day += SECS_PER_DAY;
@@ -794,6 +1073,7 @@ int main(void)
 
         if      (ui_state == UI_TITLE) draw_title(title_alpha);
         else if (ui_state == UI_MENU)  draw_menu();
+        else                           draw_toast();
 
         mixer_try_play();
         rdpq_detach_show();
