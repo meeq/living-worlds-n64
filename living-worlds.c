@@ -136,7 +136,7 @@ typedef struct {
     uint16_t pidx, pad;
 } lw_tl_t;                             /* sizeof == 8 */
 
-typedef enum { TIME_AUTO, TIME_RTC, TIME_HOLD } time_src_t;
+typedef enum { TIME_AUTO, TIME_RTC, TIME_HOLD, TIME_SRC_COUNT } time_src_t;
 
 /* On-cart save layout. Two EEPROM blocks (16 bytes); the trailing 4 bytes are
  * reserved so we can extend without bumping the magic. Persisted on every
@@ -155,41 +155,36 @@ typedef union {
 _Static_assert(sizeof(lw_save_flags_t) == 1, "lw_save_flags_t must pack into a single byte");
 
 typedef struct {
-    char            magic[4];        /* "LWS2" (was "LWS1" before day_speed_idx) */
+    char            magic[4];        /* "LWS2" */
     lw_save_flags_t flags;
     uint8_t         time_src;        /* time_src_t value */
     uint8_t         scene_idx;       /* index into the sorted scene catalog */
-    uint8_t         day_speed_idx;    /* index into DAY_SPEED_SECS (LWS1 carts: ignored, defaults to DAY_SPEED_DEFAULT) */
+    uint8_t         day_speed_idx;   /* index into DAY_SPEED_SECS */
     uint32_t        time_of_day_s;   /* seconds since midnight; only meaningful when time_src == TIME_HOLD */
     uint32_t        reserved;
 } lw_save_t;                         /* sizeof == 16 */
 _Static_assert(sizeof(lw_save_t) == 16, "lw_save_t must be 16 bytes (2 EEPROM blocks)");
 
-/* button icon spritemap loaded from rom:/buttons.sprite */
 static sprite_t *btn_sprite;
 static int       title_press_w;   /* "Press " width in FONT_TITLE (px) */
 static int       title_options_w; /* " for Options" width in FONT_TITLE (px) */
 
-/* working buffers */
 static surface_t idx_surf;            /* FMT_CI8 view over the full-res pixel bytes */
 static uint8_t   base_r[MAX_COLORS];
 static uint8_t   base_g[MAX_COLORS];
 static uint8_t   base_b[MAX_COLORS];
 static uint16_t  tlut[MAX_COLORS] __attribute__((aligned(16)));
 
-/* scene data */
 static void              *scene_buf;  /* asset_load buffer (kept alive) */
 static const lw_header_t *hdr;        /* overlay over scene_buf; source of truth for dims */
 static const uint8_t     *pal_table;  /* hdr->num_palettes * hdr->num_colors * 3, in scene_buf */
-static const lw_cycle_t  *cycles;     /* hdr->num_cycles entries, in scene_buf */
-static const lw_tl_t     *timeline;   /* hdr->num_tl entries, sorted by offset, in scene_buf */
+static const lw_cycle_t  *cycles;
+static const lw_tl_t     *timeline;   /* sorted by offset */
 
-/* scene catalog (*.lw enumerated at startup) */
 static char      scene_paths[MAX_SCENES][96];
 static int       scene_count;
 static int       scene_idx;
 
-/* runtime state */
 static bool       cycling     = true;
 static bool       blendshift  = true;
 static bool       sound_on    = true;
@@ -199,9 +194,8 @@ static time_src_t time_src    = TIME_AUTO;
 static int        day_speed_idx = DAY_SPEED_DEFAULT;
 static bool       rtc_present = false;
 
-/* UI state. The demo boots into UI_TITLE (credits overlaid on the live
- * scene), drops to UI_SCENE (bare scene, no HUD) after the title fades, and
- * toggles to UI_MENU on Start. The scene keeps animating in every state. */
+/* UI_TITLE: credits over live scene. UI_SCENE: bare scene. UI_MENU: panel.
+ * Start toggles into and out of the menu; the scene animates in every state. */
 typedef enum { UI_TITLE, UI_SCENE, UI_MENU } ui_state_t;
 
 typedef enum {
@@ -224,7 +218,7 @@ static bool       save_dirty    = false;       /* pending EEPROM flush */
 static char       toast_msg[64] = "";
 static float      toast_t       = TOAST_HOLD_S + TOAST_FADE_S;  /* start hidden */
 
-/* wav64 cache: open each unique slug at most once and stream from ROM. */
+/* Open each unique slug at most once and stream from ROM. */
 static char    wav_slugs[MAX_AUDIO_SLUGS][SLUG_MAX];
 static wav64_t wav_handles[MAX_AUDIO_SLUGS];
 static int     wav_count;
@@ -247,6 +241,31 @@ static int rtc_seconds_of_day(void)
     struct tm tmv;
     gmtime_r(&now, &tmv);
     return tmv.tm_hour * 3600 + tmv.tm_min * 60 + tmv.tm_sec;
+}
+
+static float wrap_time_of_day(float t)
+{
+    t = fmodf(t, (float)SECS_PER_DAY);
+    return t < 0 ? t + SECS_PER_DAY : t;
+}
+
+static void scrub_time_of_day(float delta_s)
+{
+    time_of_day = wrap_time_of_day(time_of_day + delta_s);
+    time_src    = TIME_HOLD;
+    save_dirty  = true;
+}
+
+/* Wrap-around add for cycling through a fixed-size enum with -1/+1 dirs. */
+static inline int cycle_enum(int v, int n, int dir) { return (v + n + dir) % n; }
+
+/* Per-frame clock tick. AUTO advances at the selected DAY_SPEED_SECS preset;
+ * RTC tracks the real clock; HOLD freezes (where manual scrub leaves us). */
+static void advance_time_of_day(float dt)
+{
+    if (time_src == TIME_AUTO)     time_of_day += (float)SECS_PER_DAY * dt / (float)DAY_SPEED_SECS[day_speed_idx];
+    else if (time_src == TIME_RTC) time_of_day = rtc_seconds_of_day();
+    time_of_day = wrap_time_of_day(time_of_day);
 }
 
 static void load_scene(const char *path)
@@ -280,7 +299,6 @@ static int cmp_path(const void *a, const void *b)
     return strcmp((const char *)a, (const char *)b);
 }
 
-/* Enumerate *.lw into scene_paths[], sorted by filename. */
 static void enumerate_scenes(void)
 {
     dir_t dir;
@@ -305,14 +323,12 @@ static void switch_scene(int delta)
     if (scene_count <= 1) return;
     scene_idx = (scene_idx + delta + scene_count) % scene_count;
     load_scene(scene_paths[scene_idx]);
-    scene_ms = 0; // restart cycling from the new scene's t=0
+    scene_ms = 0;
     start_scene_audio(hdr->audio_slug, hdr->audio_volume_q8 / 256.0f);
 }
 
-/* Resolve the time-of-day palette for `t` (seconds since midnight) into
- * base_r/g/b. Mirrors the reference's setTimeOfDayPalette: find the timeline
- * entries bracketing `t` (wrapping across midnight), then lerp the two palettes
- * per channel by the fractional position between them. */
+/* Mirrors the reference's setTimeOfDayPalette: per-channel lerp between the
+ * two timeline palettes bracketing `t`, wrapping across midnight. */
 static void rebuild_base_rgb(float t)
 {
     int ti = (int)t % SECS_PER_DAY;
@@ -323,10 +339,11 @@ static void rebuild_base_rgb(float t)
     int ai = 0;
     while (ai < n_tl && (int)timeline[ai].off <= ti) ai++;
     int bi = ai - 1;
-    int boff = (bi < 0)      ? (int)timeline[bi = n_tl - 1].off - SECS_PER_DAY
-                             : (int)timeline[bi].off;
-    int aoff = (ai >= n_tl)  ? (int)timeline[ai = 0].off + SECS_PER_DAY
-                             : (int)timeline[ai].off;
+    int boff, aoff;
+    if (bi < 0)     { bi = n_tl - 1; boff = (int)timeline[bi].off - SECS_PER_DAY; }
+    else            { boff = (int)timeline[bi].off; }
+    if (ai >= n_tl) { ai = 0;        aoff = (int)timeline[ai].off + SECS_PER_DAY; }
+    else            { aoff = (int)timeline[ai].off; }
 
     const uint8_t *bp = pal_table + (uint32_t)timeline[bi].pidx * n_col * 3;
     const uint8_t *ap = pal_table + (uint32_t)timeline[ai].pidx * n_col * 3;
@@ -381,7 +398,7 @@ static void rebuild_tlut(void)
     data_cache_hit_writeback(tlut, slots * sizeof(uint16_t));
 }
 
-/* Find a cached wav64 for `slug`, opening (and looping) it if first use. */
+/* Open (and configure for looping) on first use, then return from the cache. */
 static wav64_t *audio_get(const char *slug)
 {
     for (int i = 0; i < wav_count; i++)
@@ -396,32 +413,24 @@ static wav64_t *audio_get(const char *slug)
     return &wav_handles[wav_count++];
 }
 
-/* Step `ch_vol[ch]` toward `ch_target[ch]` at `ch_rate[ch]` and push the
- * sound_on-gated volume to the mixer. Stops the channel when an outgoing
- * fade reaches zero. */
 static void update_channel(int ch, float dt)
 {
     if (!ch_slug[ch]) return;
-    if (ch_vol[ch] != ch_target[ch]) {
-        float step = ch_rate[ch] * dt;
-        if (ch_vol[ch] < ch_target[ch])
-            ch_vol[ch] = (ch_vol[ch] + step > ch_target[ch]) ? ch_target[ch] : ch_vol[ch] + step;
-        else
-            ch_vol[ch] = (ch_vol[ch] - step < ch_target[ch]) ? ch_target[ch] : ch_vol[ch] - step;
-    }
+    float step = ch_rate[ch] * dt;
+    if      (ch_vol[ch] < ch_target[ch]) ch_vol[ch] = fminf(ch_vol[ch] + step, ch_target[ch]);
+    else if (ch_vol[ch] > ch_target[ch]) ch_vol[ch] = fmaxf(ch_vol[ch] - step, ch_target[ch]);
+
     float gated = sound_on ? ch_vol[ch] : 0.0f;
     mixer_ch_set_vol(ch, gated, gated);
+    /* Reaching zero on an outgoing fade releases the channel for reuse. */
     if (ch_vol[ch] == 0.0f && ch_target[ch] == 0.0f) {
         mixer_ch_stop(ch);
         ch_slug[ch] = NULL;
     }
 }
 
-/* Begin playing `slug` (or NULL for silence). Crossfades by flipping
- * `active_ch` to the other mixer channel: the outgoing loop continues
- * streaming on its existing channel and fades out, while the new loop fades
- * in on the freshly-claimed channel. Mirrors reference startSceneAudio /
- * stopSceneAudio (~2 s in, ~0.4 s out).
+/* Begin playing `slug` (or NULL for silence). Mirrors reference
+ * startSceneAudio / stopSceneAudio (~2 s in, ~0.4 s out).
  *
  * Same-slug transitions intentionally keep the existing loop playing rather
  * than restarting it: the reference's HTML5 Audio rebuild produces an audible
@@ -433,8 +442,7 @@ static void start_scene_audio(const char *slug, float max_vol)
 
     if (have_new && ch_slug[active_ch] && strcmp(ch_slug[active_ch], slug) == 0) {
         ch_target[active_ch] = max_vol;
-        float delta = fabsf(max_vol - ch_vol[active_ch]);
-        ch_rate[active_ch]   = delta > 0 ? delta / FADE_IN_S : 0.0f;
+        ch_rate[active_ch]   = fabsf(max_vol - ch_vol[active_ch]) / FADE_IN_S;
         return;
     }
 
@@ -466,27 +474,22 @@ static void start_scene_audio(const char *slug, float max_vol)
     }
 }
 
-/* Read the persisted save (if any) and overlay it on the defaults. Silent
- * no-op on carts without EEPROM or with a stale/missing magic. Must run after
- * enumerate_scenes() so scene_idx can be range-checked against scene_count. */
+/* Silent no-op on carts without EEPROM or with a stale/missing magic. Must
+ * run after enumerate_scenes() so scene_idx can be range-checked. */
 static void save_load(void)
 {
     if (eeprom_present() == EEPROM_NONE) return;
     lw_save_t s;
     eeprom_read_bytes(&s, 0, sizeof(s));
-    bool lws2 = memcmp(s.magic, "LWS2", 4) == 0;
-    bool lws1 = memcmp(s.magic, "LWS1", 4) == 0;
-    if (!lws1 && !lws2) return;
+    if (memcmp(s.magic, "LWS2", 4) != 0) return;
 
     cycling    = s.flags.cycling;
     blendshift = s.flags.blendshift;
     sound_on   = s.flags.sound_on;
-    if (s.time_src <= TIME_HOLD)             time_src    = (time_src_t)s.time_src;
-    if (s.scene_idx < (unsigned)scene_count) scene_idx   = s.scene_idx;
-    if (s.time_of_day_s < SECS_PER_DAY)      time_of_day = (float)s.time_of_day_s;
-    /* LWS1 carts left this byte as pad (zero), which would resolve to the slowest
-     * preset rather than the intended 60x default — ignore it for legacy saves. */
-    if (lws2 && s.day_speed_idx < DAY_SPEED_N) day_speed_idx = s.day_speed_idx;
+    if (s.time_src < TIME_SRC_COUNT)         time_src      = (time_src_t)s.time_src;
+    if (s.scene_idx < (unsigned)scene_count) scene_idx     = s.scene_idx;
+    if (s.time_of_day_s < SECS_PER_DAY)      time_of_day   = (float)s.time_of_day_s;
+    if (s.day_speed_idx < DAY_SPEED_N)       day_speed_idx = s.day_speed_idx;
 }
 
 /* Serialize the current settings into 2 EEPROM blocks. libdragon writes
@@ -523,7 +526,6 @@ static void fill_rect_alpha(int x0, int y0, int x1, int y1, color_t c)
     rdpq_fill_rectangle(x0, y0, x1, y1);
 }
 
-/* Re-style FONT_TITLE so its color/outline alpha tracks the title fade. */
 static void title_set_alpha(float a)
 {
     uint8_t aa = (uint8_t)(a * 255.0f);
@@ -534,6 +536,15 @@ static void title_set_alpha(float a)
     });
 }
 
+static int title_measure(const char *s)
+{
+    int n = strlen(s);
+    rdpq_paragraph_t *p = rdpq_paragraph_build(&(rdpq_textparms_t){0}, FONT_TITLE, s, &n);
+    int w = (int)p->advance_x;
+    rdpq_paragraph_free(p);
+    return w;
+}
+
 /* Forward declaration: draw_title embeds a Start icon in its prompt; the
  * sprite helpers live further down with the menu code. */
 static void draw_btn_fade(int x, int y, btn_t b, float a);
@@ -542,7 +553,6 @@ static void draw_title(float alpha)
 {
     if (alpha <= 0.0f) return;
 
-    /* Vignette over the live scene. */
     fill_rect_alpha(0, 0, 640, 480,
         RGBA32(0, 0, 0, (uint8_t)(TITLE_VIG_A * alpha)));
 
@@ -557,10 +567,8 @@ static void draw_title(float alpha)
         "Original code by Ian Gilman and Joseph Huckaby");
     rdpq_text_printf(&centered, FONT_TITLE, 0, 270,
         "N64 port by Christopher Bonhage");
-    /* "Press [Start] for Options" with the Start button icon inline. The
-     * fragment widths were measured at startup; this just chains three left-
-     * aligned draws across a centered span. The icon uses draw_btn_fade so
-     * it dims in lockstep with the title text. */
+    /* Fragment widths were measured at startup; draw_btn_fade dims in
+     * lockstep with the surrounding title text. */
     int prompt_total = title_press_w + BTN_SIZE + title_options_w;
     int prompt_x     = (640 - prompt_total) / 2;
     rdpq_text_printf(NULL, FONT_TITLE, prompt_x, 430, "Press ");
@@ -609,26 +617,9 @@ static void draw_toast(void)
         "%s", toast_msg);
 }
 
-/* Blit one 12x12 cell out of the button spritemap. The icon at the requested
- * btn_t maps row-major into the 4x4 grid of cells in btn_sprite. Resets RDP
- * mode each call: the surrounding text renderer leaves the pipeline in a
+/* Blit one 12x12 cell from btn_sprite, modulated by `a` (1.0 = opaque). Resets
+ * RDP mode each call: the surrounding text renderer leaves the pipeline in a
  * text-glyph mode that produces garbled output for raw sprite blits. */
-static void draw_btn(int x, int y, btn_t b)
-{
-    int col = (int)b & 3;
-    int row = (int)b >> 2;
-    rdpq_set_mode_standard();
-    rdpq_mode_tlut(TLUT_NONE);
-    rdpq_mode_blender(RDPQ_BLENDER_MULTIPLY);
-    rdpq_sprite_blit(btn_sprite, x, y, &(rdpq_blitparms_t){
-        .s0 = col * BTN_SIZE, .t0 = row * BTN_SIZE,
-        .width = BTN_SIZE,    .height = BTN_SIZE,
-    });
-}
-
-/* Faded variant of draw_btn used by the title-screen prompt: modulates the
- * sprite RGBA by a prim color whose alpha is the fade level, so the icon
- * fades in lockstep with the surrounding FONT_TITLE text. */
 static void draw_btn_fade(int x, int y, btn_t b, float a)
 {
     uint8_t aa = (uint8_t)(a * 255.0f);
@@ -644,6 +635,8 @@ static void draw_btn_fade(int x, int y, btn_t b, float a)
         .width = BTN_SIZE,    .height = BTN_SIZE,
     });
 }
+
+static void draw_btn(int x, int y, btn_t b) { draw_btn_fade(x, y, b, 1.0f); }
 
 /* Format DAY_SPEED_SECS[idx] as a compact human label ("1h", "20m", "30s"). The
  * preset table is hand-picked so every entry divides cleanly into hours,
@@ -684,7 +677,6 @@ static int cheat_text(int x, int y, const char *s)
 
 static void draw_menu(void)
 {
-    /* Panel: translucent dark fill, then a thin light frame. */
     fill_rect_alpha(MENU_X0, MENU_Y0, MENU_X1, MENU_Y1,
         RGBA32(0, 0, 0, MENU_PANEL_A));
     color_t edge = RGBA32(255, 255, 255, 220);
@@ -693,25 +685,24 @@ static void draw_menu(void)
     fill_rect_alpha(MENU_X0,     MENU_Y0,     MENU_X0 + 2, MENU_Y1,     edge);
     fill_rect_alpha(MENU_X1 - 2, MENU_Y0,     MENU_X1,     MENU_Y1,     edge);
 
-    /* Re-enter standard mode so the font path picks a sane combiner. */
+    /* fill_rect_alpha leaves the pipeline in a FLAT combiner; reset for text. */
     rdpq_set_mode_standard();
 
-    const int label_x = MENU_X0 + MENU_PAD;        /* left column */
-    const int value_x = MENU_X0 + 160;             /* right column */
+    const int label_x = MENU_X0 + MENU_PAD;
+    const int value_x = MENU_X0 + 160;
     int       y       = MENU_Y0 + MENU_PAD + 18;
 
     int t = (int)time_of_day;
     int hh = t / 3600, mm = (t / 60) % 60;
 
-    /* Per-row labels and values for the single-line rows. ROW_SCENE is
-     * handled specially below so its (potentially long) title can have a
-     * whole line to itself. */
+    /* ROW_SCENE gets its own two-line block below; labels/values here only
+     * cover the single-line rows. */
     const char *labels[ROW_COUNT] = {
         "Scene", "Sound", "Color Cycling", "Color Blending",
         "Time Source", "AUTO Day Speed", "Time of Day",
     };
     char values[ROW_COUNT][32];
-    values[ROW_SCENE][0] = 0;   /* unused */
+    values[ROW_SCENE][0] = 0;
     snprintf(values[ROW_CYCLING],     sizeof(values[0]), "[%s]", cycling    ? "ON" : "OFF");
     snprintf(values[ROW_BLENDSHIFT],  sizeof(values[0]), "[%s]", blendshift ? "ON" : "OFF");
     snprintf(values[ROW_TIME_SOURCE], sizeof(values[0]), "< %s >", time_src_label());
@@ -725,9 +716,7 @@ static void draw_menu(void)
         const char *style_close = focused ? "^00" : "";
 
         if (i == ROW_SCENE) {
-            /* Two-line layout: "> Scene  N/M" then "  < Title >" indented
-             * underneath, so the full hdr->title is visible regardless of
-             * length. Both lines share the focused style when selected. */
+            /* Two lines so the full hdr->title fits regardless of length. */
             rdpq_text_printf(NULL, FONT_HUD, label_x, y,
                 "%s%s Scene  %d/%d%s",
                 style_open, focused ? ">" : " ",
@@ -746,11 +735,8 @@ static void draw_menu(void)
         y += MENU_ROW_H;
     }
 
-    /* Off-menu controls cheat sheet. Heading announces what the icons mean
-     * (off-menu, not in-menu bindings); each row below is a left-to-right
-     * sequence of icon/text tokens via cheat_btn / cheat_text, with the
-     * helpers returning the next x cursor. Rows are sized to fit in the
-     * 332 px panel inner width (12 px icons, 8 px mono chars). */
+    /* Off-menu controls cheat sheet. Rows are sized to fit in the 332 px
+     * panel inner width (12 px icons, 8 px mono chars). */
     y += 6;
     rdpq_text_printf(NULL, FONT_HUD, label_x, y, "Controls (when menu is closed)");
     y += MENU_ROW_H;
@@ -800,14 +786,9 @@ static void menu_change(int row, int dir)
         case ROW_SCENE:       switch_scene(dir); break;
         case ROW_CYCLING:     cycling    = !cycling;    break;
         case ROW_BLENDSHIFT:  blendshift = !blendshift; break;
-        case ROW_TIME_SOURCE: time_src   = (time_src + 3 + dir) % 3; break;
-        case ROW_SPEED:       day_speed_idx = (day_speed_idx + DAY_SPEED_N + dir) % DAY_SPEED_N; break;
-        case ROW_TIME_OF_DAY:
-            /* Discrete nudge: 1 hour per press, force HOLD. */
-            time_of_day = fmodf(time_of_day + dir * 3600.0f + SECS_PER_DAY,
-                                (float)SECS_PER_DAY);
-            time_src = TIME_HOLD;
-            break;
+        case ROW_TIME_SOURCE: time_src   = cycle_enum(time_src, TIME_SRC_COUNT, dir); break;
+        case ROW_SPEED:       day_speed_idx = cycle_enum(day_speed_idx, DAY_SPEED_N, dir); break;
+        case ROW_TIME_OF_DAY: scrub_time_of_day(dir * 3600.0f); break;
         case ROW_SOUND:       sound_on   = !sound_on;   break;
     }
     save_dirty = true;
@@ -822,23 +803,19 @@ static void menu_activate(int row)
     }
 }
 
-/* Per-frame menu input. Returns true if the menu should close. `dt` drives
- * the analog-stick scrub on the Time of day row. */
+/* `dt` drives the analog-stick scrub on the Time of day row. Returns true
+ * if the menu should close. */
 static bool menu_handle_input(joypad_buttons_t pressed, float dt)
 {
     if (pressed.start || pressed.b) return true;
 
-    /* Vertical nav: D-pad edges + analog stick Y edges (libdragon gives us
-     * D-pad-equivalent press/held events for the stick). */
     int dy = 0;
     if (pressed.d_up)   dy--;
     if (pressed.d_down) dy++;
-    int sy = joypad_get_axis_pressed(JOYPAD_PORT_1, JOYPAD_AXIS_STICK_Y);
     /* Stick Y is positive-up in libdragon, so invert to match d_down=+1. */
-    dy -= sy;
-    if (dy) menu_focus = (menu_focus + ROW_COUNT + (dy > 0 ? 1 : -1)) % ROW_COUNT;
+    dy -= joypad_get_axis_pressed(JOYPAD_PORT_1, JOYPAD_AXIS_STICK_Y);
+    if (dy) menu_focus = cycle_enum(menu_focus, ROW_COUNT, dy > 0 ? 1 : -1);
 
-    /* Horizontal change on focused row. */
     int dx = 0;
     if (pressed.d_left)  dx--;
     if (pressed.d_right) dx++;
@@ -847,41 +824,30 @@ static bool menu_handle_input(joypad_buttons_t pressed, float dt)
 
     if (pressed.a) menu_activate(menu_focus);
 
-    /* Hold-to-scrub when the Time of day row is focused. Mirrors the old
-     * C-left/C-right behaviour: scrub forces TIME_HOLD so the value sticks. */
+    /* Hold-to-scrub on the Time of day row. Forces TIME_HOLD so the value sticks. */
     if (menu_focus == ROW_TIME_OF_DAY) {
         int hx = 0;
         joypad_buttons_t held = joypad_get_buttons_held(JOYPAD_PORT_1);
         if (held.d_left)  hx--;
         if (held.d_right) hx++;
         hx += joypad_get_axis_held(JOYPAD_PORT_1, JOYPAD_AXIS_STICK_X);
-        if (hx) {
-            time_of_day += hx * SCRUB_RATE * dt;
-            time_src   = TIME_HOLD;
-            save_dirty = true;
-        }
+        if (hx) scrub_time_of_day(hx * SCRUB_RATE * dt);
     }
 
     return false;
 }
 
-/* Per-frame input when the menu is closed. Returns true to enter the menu.
- * Each handled binding fires a bottom-right toast so the action is visible
- * without opening the menu, and (where it changes persisted state) flips
- * save_dirty so save_flush() picks it up next frame. */
+/* Returns true to enter the menu. Off-menu bindings fire a bottom-right
+ * toast so the action is visible without opening the menu. */
 static bool scene_handle_input(joypad_buttons_t pressed, float dt)
 {
     if (pressed.start || pressed.a) return true;
 
-    if (pressed.l || pressed.z) {
-        switch_scene(-1);
-        toast_show("< Scene %d/%d  %s", scene_idx + 1, scene_count, hdr->title);
-        save_dirty = true;
-        return false;
-    }
-    if (pressed.r) {
-        switch_scene(+1);
-        toast_show("Scene %d/%d >  %s", scene_idx + 1, scene_count, hdr->title);
+    int scene_dir = pressed.r ? +1 : (pressed.l || pressed.z) ? -1 : 0;
+    if (scene_dir) {
+        switch_scene(scene_dir);
+        toast_show(scene_dir < 0 ? "< Scene %d/%d  %s" : "Scene %d/%d >  %s",
+                   scene_idx + 1, scene_count, hdr->title);
         save_dirty = true;
         return false;
     }
@@ -902,30 +868,27 @@ static bool scene_handle_input(joypad_buttons_t pressed, float dt)
         save_dirty = true;
     }
 
-    /* C-Left/Right scrubs time-of-day continuously while held (same SCRUB_RATE
-     * as the in-menu Time of Day row). Toast refreshes each frame so the HH:MM
-     * readout follows the scrub and stays visible until release. */
+    /* C-Left/Right scrubs time-of-day continuously while held. Toast refreshes
+     * each frame so the HH:MM readout follows the scrub and stays visible until
+     * release. */
     joypad_buttons_t held = joypad_get_buttons_held(JOYPAD_PORT_1);
     int hx = (held.c_right ? 1 : 0) - (held.c_left ? 1 : 0);
     if (hx) {
-        time_of_day = fmodf(time_of_day + hx * SCRUB_RATE * dt + SECS_PER_DAY,
-                            (float)SECS_PER_DAY);
-        time_src = TIME_HOLD;
+        scrub_time_of_day(hx * SCRUB_RATE * dt);
         int t = (int)time_of_day;
         toast_show("Time of Day: %02d:%02d", t / 3600, (t / 60) % 60);
-        save_dirty = true;
     }
 
     int dx = (pressed.d_right ? 1 : 0) - (pressed.d_left ? 1 : 0);
     if (dx) {
-        time_src = (time_src + 3 + dx) % 3;
+        time_src = cycle_enum(time_src, TIME_SRC_COUNT, dx);
         toast_show("Time Source: %s", time_src_label());
         save_dirty = true;
     }
 
     int dy = (pressed.d_down ? 1 : 0) - (pressed.d_up ? 1 : 0);
     if (dy) {
-        day_speed_idx = (day_speed_idx + DAY_SPEED_N + dy) % DAY_SPEED_N;
+        day_speed_idx = cycle_enum(day_speed_idx, DAY_SPEED_N, dy);
         time_src = TIME_AUTO;
         toast_show("AUTO Day Speed: %s", day_speed_label(day_speed_idx));
         save_dirty = true;
@@ -988,22 +951,11 @@ int main(void)
     btn_sprite = sprite_load("rom:/buttons.sprite");
     assertf(btn_sprite, "could not load rom:/buttons.sprite");
 
-    /* Measure the two FONT_TITLE fragments straddling the title-screen Start
-     * icon. Layout once, cache the widths, free the layouts — draw_title
-     * uses them every frame to center "Press [Start] for Options" without
-     * any per-frame allocation. */
-    {
-        int n;
-        rdpq_paragraph_t *p;
-        n = strlen("Press ");
-        p = rdpq_paragraph_build(&(rdpq_textparms_t){0}, FONT_TITLE, "Press ", &n);
-        title_press_w = (int)p->advance_x;
-        rdpq_paragraph_free(p);
-        n = strlen(" for Options");
-        p = rdpq_paragraph_build(&(rdpq_textparms_t){0}, FONT_TITLE, " for Options", &n);
-        title_options_w = (int)p->advance_x;
-        rdpq_paragraph_free(p);
-    }
+    /* Measure the FONT_TITLE fragments straddling the Start icon once, so
+     * draw_title can re-center "Press [Start] for Options" every frame without
+     * allocating. */
+    title_press_w   = title_measure("Press ");
+    title_options_w = title_measure(" for Options");
 
     uint32_t last = get_ticks_ms();
     while (1) {
@@ -1048,13 +1000,7 @@ int main(void)
 
         scene_ms += dms;
 
-        /* Day clock. AUTO advances at the selected SIM_RATES preset; RTC
-         * tracks the real clock; HOLD freezes (also where manual scrub leaves us). */
-        if (time_src == TIME_AUTO)      time_of_day += (float)SECS_PER_DAY * dt / (float)DAY_SPEED_SECS[day_speed_idx];
-        else if (time_src == TIME_RTC)  time_of_day = rtc_seconds_of_day();
-        time_of_day = fmodf(time_of_day, (float)SECS_PER_DAY);
-        if (time_of_day < 0) time_of_day += SECS_PER_DAY;
-
+        advance_time_of_day(dt);
         rebuild_base_rgb(time_of_day);
         rebuild_tlut();
 
