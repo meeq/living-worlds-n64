@@ -684,7 +684,6 @@ int main(void)
 
     dfs_init(DFS_DEFAULT_LOCATION);
     rdpq_init();
-    rdpq_debug_start();
     joypad_init();
     timer_init();
 
