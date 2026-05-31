@@ -4,6 +4,12 @@ A libdragon port of [Living Worlds](http://www.effectgames.com/demos/worlds/)
 — Mark Ferrari's color-cycling pixel art running on Nintendo 64 via the CI8
 texture format and per-frame TLUT animation.
 
+
+| Description | Screenshot |
+| :---: | :---: |
+| **Sample Scene** | ![](screenshots/sample.gif) |
+| **Menu Options** | ![](screenshots/menu.png) |
+
 ## Building
 
 ### 1. Prerequisites
