@@ -8,8 +8,7 @@
 
 #define CYCLE_SPEED 280.0f    /* matches the reference engine (palette.js) */
 
-uint16_t tlut[MAX_COLORS] __attribute__((aligned(16)));
-
+static uint16_t           tlut[MAX_COLORS] __attribute__((aligned(16)));
 static const lw_header_t *cur_hdr;
 static const uint8_t     *pal_table;
 static const lw_cycle_t  *cycles;
@@ -105,4 +104,9 @@ void palette_rebuild(float t)
 {
     rebuild_base_rgb(t);
     rebuild_tlut();
+}
+
+void palette_upload(void)
+{
+    rdpq_tex_upload_tlut(tlut, 0, cur_hdr->num_colors);
 }

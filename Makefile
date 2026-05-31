@@ -7,7 +7,6 @@ src = \
     src/clock.c \
     src/main.c \
     src/palette.c \
-    src/save.c \
     src/scene.c \
     src/settings.c \
     src/sounds.c \

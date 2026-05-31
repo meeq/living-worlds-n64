@@ -31,7 +31,6 @@
 
 #include "clock.h"
 #include "palette.h"
-#include "save.h"
 #include "scene.h"
 #include "settings.h"
 #include "sounds.h"
@@ -54,7 +53,6 @@ int main(void)
         // Start the scene at the middle of the day so the demo looks good
         settimeofday(&(struct timeval){ .tv_sec = SECS_MID_DAY }, NULL);
     }
-    time_of_day = rtc_seconds_of_day();   /* open at the real time of day */
 
     sounds_init();
 
@@ -63,7 +61,7 @@ int main(void)
     /* Pull persisted settings before the first scene load so the saved
      * scene_idx wins. For AUTO/RTC modes, snap time_of_day back to the real
      * clock -- the saved value is only authoritative when source is HOLD. */
-    save_load();
+    settings_load();
     if (time_src != TIME_HOLD) time_of_day = rtc_seconds_of_day();
 
     scene_load(scene_idx);
@@ -92,18 +90,13 @@ int main(void)
         surface_t *disp = display_get();
         rdpq_attach_clear(disp, NULL);
 
-        rdpq_set_mode_standard();
-        rdpq_mode_tlut(TLUT_RGBA16);
-        rdpq_mode_filter(FILTER_POINT);
-        rdpq_tex_upload_tlut(tlut, 0, hdr->num_colors);
-        rdpq_tex_blit(&idx_surf, 0, 0, NULL);
-
+        scene_draw();
         ui_draw();
 
         mixer_try_play();
         rdpq_detach_show();
         mixer_try_play();
 
-        save_flush();
+        settings_flush();
     }
 }

@@ -27,7 +27,6 @@ typedef struct {
 } lw_tl_t;                             /* sizeof == 8 */
 
 extern const lw_header_t *hdr;         /* current scene's header */
-extern surface_t          idx_surf;    /* FMT_CI8 view over the pixel bytes */
 extern int                scene_count;
 
 /* Enumerate rom:/ for *.lw files into the catalog; assertf if none found. */
@@ -39,3 +38,7 @@ void scene_load(int idx);
 
 /* Wrap `delta` around the catalog and scene_load() the resulting index. */
 void scene_advance(int delta);
+
+/* Upload the current TLUT and blit the indexed image. Caller owns the
+ * surrounding rdpq_attach_clear / rdpq_detach_show. */
+void scene_draw(void);

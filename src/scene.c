@@ -12,11 +12,11 @@
 #define MAX_SCENES 32
 
 const lw_header_t *hdr;
-surface_t          idx_surf;
 int                scene_count;
 
-static char  scene_paths[MAX_SCENES][96];
-static void *scene_buf;
+static surface_t idx_surf;    /* FMT_CI8 view over the current scene's pixel bytes */
+static char      scene_paths[MAX_SCENES][96];
+static void     *scene_buf;
 
 static void load_scene_file(const char *path)
 {
@@ -76,4 +76,13 @@ void scene_advance(int delta)
 {
     if (scene_count <= 1) return;
     scene_load((scene_idx + delta + scene_count) % scene_count);
+}
+
+void scene_draw(void)
+{
+    rdpq_set_mode_standard();
+    rdpq_mode_tlut(TLUT_RGBA16);
+    rdpq_mode_filter(FILTER_POINT);
+    palette_upload();
+    rdpq_tex_blit(&idx_surf, 0, 0, NULL);
 }

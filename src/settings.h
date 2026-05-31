@@ -30,3 +30,13 @@ const char *day_speed_label(int idx);
 
 /* Wrap-around add for cycling through a fixed-size enum with -1/+1 dirs. */
 static inline int cycle_enum(int v, int n, int dir) { return (v + n + dir) % n; }
+
+/* Read EEPROM and apply to the globals above (silent no-op on carts without
+ * EEPROM or with a stale/missing magic). Must run after scene_init() so the
+ * persisted scene index can be range-checked. */
+void settings_load(void);
+
+/* Persist the current settings if `save_dirty` is set. Cheap memcpy-class
+ * call into libdragon's RAM-cached EEPROM driver; rate-limited to once per
+ * frame so a held scrub doesn't burst writes. */
+void settings_flush(void);
